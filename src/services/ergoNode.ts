@@ -228,17 +228,19 @@ export class ErgoNodeService {
                 continue;
               }
               
-              // Find boxes that will become eligible soon (next 1000 blocks) or are already eligible
-              console.log(`Box height: ${box.creationHeight}, cutoff: ${cutoffHeight} minAge: ${minAge}`);
-              const blocksUntilEligible = (cutoffHeight - box.creationHeight);
+              // Calculate when this box becomes eligible
+              const eligibleAtHeight = box.creationHeight + minAge;
+              const blocksUntilEligible = eligibleAtHeight - currentHeight;
+              
+              console.log(`Box height: ${box.creationHeight}, eligibleAt: ${eligibleAtHeight}, current: ${currentHeight}, blocksUntil: ${blocksUntilEligible}`);
               
               // Debug unspent boxes
               if (boxesChecked % 100 === 0) {
-                console.log(`UNSPENT box ${boxId}: height=${box.creationHeight}, blocksUntil=${blocksUntilEligible}, cutoff=${cutoffHeight}`);
+                console.log(`UNSPENT box ${boxId}: height=${box.creationHeight}, blocksUntil=${blocksUntilEligible}`);
               }
               
               // Skip if too far in future (>1000 blocks)
-              if (blocksUntilEligible > 0) {
+              if (blocksUntilEligible > 1000) {
                 continue;
               }
               
@@ -260,7 +262,7 @@ export class ErgoNodeService {
                   boxSize,
                   value: boxValue,
                   rentFee,
-                  status: blocksUntilEligible <= 0 ? 'pending' : 'queued',
+                  status: blocksUntilEligible < 0 ? 'pending' : 'queued', // Require strictly past eligibility
                   discoveredAt: new Date(),
                   ergoTree: box.ergoTree,
                   assets: box.assets ? box.assets.map((asset: any) => ({

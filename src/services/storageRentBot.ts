@@ -196,12 +196,19 @@ export class StorageRentBot {
       const minAge = this.config.minStorageRentAgeBlocks;
       const cutoffHeight = currentHeight - minAge;
       
+      this.logger.info(`Checking eligibility: currentHeight=${currentHeight}, minAge=${minAge}, cutoffHeight=${cutoffHeight}`, { component: 'processor' });
+      
       // Find all boxes from heights that are now eligible
       const nowEligible: EligibleBox[] = [];
       const heightsToRemove: number[] = [];
       
       for (const [height, boxes] of this.queuedBoxesByHeight) {
-        if (height <= cutoffHeight) {
+        const eligibleAtHeight = height + minAge;
+        const isEligible = currentHeight > eligibleAtHeight; // Require strictly greater to be safe
+        
+        this.logger.info(`Height ${height}: eligibleAt=${eligibleAtHeight}, current=${currentHeight}, isEligible=${isEligible}`, { component: 'processor' });
+        
+        if (isEligible) {
           nowEligible.push(...boxes);
           heightsToRemove.push(height);
         }
