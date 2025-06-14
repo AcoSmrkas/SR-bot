@@ -91,8 +91,9 @@ export class TransactionService {
     // Calculate total input value
     const totalInputValue = boxes.reduce((sum, box) => sum + box.value, 0n);
     
-    // Calculate total output value (new boxes + rent collection)
-    const totalOutputValue = boxes.reduce((sum, box) => sum + (box.value - box.rentFee), 0n) + totalRentCollected;
+    // Calculate total output value (new boxes + rent collection minus fee)
+    const rentAfterFee = totalRentCollected - BigInt(RECOMMENDED_MIN_FEE_VALUE);
+    const totalOutputValue = boxes.reduce((sum, box) => sum + (box.value - box.rentFee), 0n) + rentAfterFee;
     
     // Calculate transaction fee
     const transactionFee = BigInt(RECOMMENDED_MIN_FEE_VALUE);
@@ -102,7 +103,7 @@ export class TransactionService {
     console.log(`Total input value: ${totalInputValue} nanoErgs`);
     console.log(`Total output value: ${totalOutputValue} nanoErgs`);
     console.log(`  - New boxes total: ${boxes.reduce((sum, box) => sum + (box.value - box.rentFee), 0n)} nanoErgs`);
-    console.log(`  - Rent collected: ${totalRentCollected} nanoErgs`);
+    console.log(`  - Rent collected (after fee): ${rentAfterFee} nanoErgs (${totalRentCollected} - ${transactionFee})`);
     console.log(`Transaction fee: ${transactionFee} nanoErgs`);
     console.log(`Input - Output: ${totalInputValue - totalOutputValue} nanoErgs (should cover fee)`);
     console.log(`Box count: ${boxes.length}`);
@@ -167,10 +168,13 @@ export class TransactionService {
       console.log(`Added ${additionalInputs.length} wallet UTXOs providing ${walletValue} nanoErgs`);
     }
     
-    // The fee will be automatically deducted from inputs by Fleet SDK
-    // So we collect the full rent amount and let the SDK handle fee payment
+    // Check if we have enough rent to pay the fee
+    if (rentAfterFee <= 0n) {
+      throw new Error(`Not enough rent collected to pay transaction fee. Rent: ${totalRentCollected}, Fee: ${transactionFee}`);
+    }
+    
     const rentCollectionOutput = new OutputBuilder(
-      totalRentCollected.toString(),
+      rentAfterFee.toString(),
       changeAddr
     );
 
