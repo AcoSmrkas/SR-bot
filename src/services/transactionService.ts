@@ -87,9 +87,17 @@ export class TransactionService {
       .setAdditionalRegisters(box.additionalRegisters);
     });
 
-    // Add change output to collect rent fees
+    // Deduct transaction fee from collected rent
+    const transactionFee = BigInt(RECOMMENDED_MIN_FEE_VALUE);
+    const rentAfterFee = totalRentCollected - transactionFee;
+    
+    if (rentAfterFee <= 0n) {
+      throw new Error(`Insufficient rent collected to pay transaction fee. Collected: ${totalRentCollected}, Fee: ${transactionFee}`);
+    }
+
+    // Add change output to collect rent fees (minus transaction fee)
     const rentCollectionOutput = new OutputBuilder(
-      totalRentCollected.toString(),
+      rentAfterFee.toString(),
       changeAddr
     );
 
