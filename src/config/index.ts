@@ -83,7 +83,7 @@ export function loadConfig(): Config {
     // Bot Behavior
     dryRun: getEnvBoolean('DRY_RUN', process.env.NODE_ENV === 'dry-run'),
     enableCron: getEnvBoolean('ENABLE_CRON', true),
-    cronSchedule: getEnvVar('CRON_SCHEDULE', '*/5 * * * * *'), // Every 5 seconds for height checks
+    cronSchedule: getEnvVar('CRON_SCHEDULE', '*/2 * * * * *'), // Every 2 seconds for competitive claiming
 
     // Monitoring
     enableMetrics: getEnvBoolean('ENABLE_METRICS', true),

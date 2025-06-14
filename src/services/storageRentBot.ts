@@ -204,9 +204,7 @@ export class StorageRentBot {
       
       for (const [height, boxes] of this.queuedBoxesByHeight) {
         const eligibleAtHeight = height + minAge;
-        const isEligible = currentHeight > eligibleAtHeight; // Require strictly greater to be safe
-        
-        this.logger.info(`Height ${height}: eligibleAt=${eligibleAtHeight}, current=${currentHeight}, isEligible=${isEligible}`, { component: 'processor' });
+        const isEligible = currentHeight >= eligibleAtHeight; // Claim as soon as eligible
         
         if (isEligible) {
           nowEligible.push(...boxes);

@@ -262,7 +262,7 @@ export class ErgoNodeService {
                   boxSize,
                   value: boxValue,
                   rentFee,
-                  status: blocksUntilEligible < 0 ? 'pending' : 'queued', // Require strictly past eligibility
+                  status: blocksUntilEligible <= 0 ? 'pending' : 'queued', // Eligible as soon as blocks reach threshold
                   discoveredAt: new Date(),
                   ergoTree: box.ergoTree,
                   assets: box.assets ? box.assets.map((asset: any) => ({
