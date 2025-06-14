@@ -180,6 +180,7 @@ export class TransactionService {
       changeAddr
     );
 
+    // Fleet SDK automatically includes currentHeight in context extension for storage rent validation
     const unsignedTx = new TransactionBuilder(currentHeight)
       .from(allInputBoxes)
       .to([...outputs, rentCollectionOutput])
@@ -198,6 +199,8 @@ export class TransactionService {
   // Sign and submit transaction using ergo-lib-wasm (fromUnsigned function)
   async fromUnsigned(unsignedTxJson: any): Promise<[string | null, any]> {
     try {
+      console.log(unsignedTxJson)
+
       const unsignedTx = ergo.UnsignedTransaction.from_json(jsonBigInt.stringify(unsignedTxJson));
       
       const inputBoxes = ergo.ErgoBoxes.from_boxes_json(unsignedTxJson.inputs);
