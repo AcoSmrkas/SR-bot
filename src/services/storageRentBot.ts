@@ -354,11 +354,21 @@ export class StorageRentBot {
         dryRun: this.config.dryRun
       });
 
-      // Get pending boxes from database
-      const pendingBoxes = await this.database.getEligibleBoxes('pending');
+      // Save newly eligible boxes to database first
+      for (const box of eligibleBoxes) {
+        try {
+          await this.database.insertEligibleBox(box);
+        } catch (error) {
+          this.logger.warn('Failed to save eligible box to database', {
+            component: 'processor',
+            boxId: box.boxId,
+            error: error as Error
+          });
+        }
+      }
       
-      // Validate boxes are still unspent
-      const boxIds = pendingBoxes.map(box => box.boxId);
+      // Validate the passed eligible boxes are still unspent
+      const boxIds = eligibleBoxes.map(box => box.boxId);
       const validation = await this.ergoNode.validateBoxes(boxIds);
       
       // Update invalid boxes in database
@@ -367,7 +377,7 @@ export class StorageRentBot {
       }
 
       // Filter to only valid boxes
-      const validBoxes = pendingBoxes.filter(box => 
+      const validBoxes = eligibleBoxes.filter(box => 
         validation.valid.includes(box.boxId)
       );
 
