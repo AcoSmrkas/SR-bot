@@ -484,7 +484,8 @@ export class StorageRentBot {
       const { unsignedTx, inputBoxes, totalRentCollected } = await this.transactionService.buildStorageRentTransaction(
         boxes,
         changeAddress,
-        currentHeight
+        currentHeight,
+        this.ergoNode
       );
 
       // Validate transaction

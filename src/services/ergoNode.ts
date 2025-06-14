@@ -333,6 +333,20 @@ export class ErgoNodeService {
     return { boxesByHeight, nextOffset };
   }
 
+  // Get wallet UTXOs for a given address
+  async getWalletUtxos(address: string): Promise<any[]> {
+    try {
+      // Use blockchain API to find UTXOs for the address
+      const response = await this.client.get('/blockchain/box/unspent/byAddress', {
+        params: { address, limit: 100 }
+      });
+      return response.data;
+    } catch (error) {
+      console.warn(`Failed to get wallet UTXOs for ${address}:`, error);
+      return [];
+    }
+  }
+
   // Validate boxes are still unspent
   async validateBoxes(boxIds: string[]): Promise<{
     valid: string[];

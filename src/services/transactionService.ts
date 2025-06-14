@@ -40,7 +40,8 @@ export class TransactionService {
   async buildStorageRentTransaction(
     boxes: EligibleBox[],
     changeAddress: string,
-    currentHeight: number
+    currentHeight: number,
+    ergoNode?: any
   ): Promise<{
     unsignedTx: any;
     inputBoxes: any[];
@@ -87,22 +88,76 @@ export class TransactionService {
       .setAdditionalRegisters(box.additionalRegisters);
     });
 
-    // Deduct transaction fee from collected rent
-    const transactionFee = BigInt(RECOMMENDED_MIN_FEE_VALUE);
-    const rentAfterFee = totalRentCollected - transactionFee;
+    // Calculate total input value
+    const totalInputValue = boxes.reduce((sum, box) => sum + box.value, 0n);
     
-    if (rentAfterFee <= 0n) {
-      throw new Error(`Insufficient rent collected to pay transaction fee. Collected: ${totalRentCollected}, Fee: ${transactionFee}`);
+    // Calculate total output value (new boxes + rent collection)
+    const totalOutputValue = boxes.reduce((sum, box) => sum + (box.value - box.rentFee), 0n) + totalRentCollected;
+    
+    // Calculate transaction fee
+    const transactionFee = BigInt(RECOMMENDED_MIN_FEE_VALUE);
+    
+    // Check if inputs cover outputs + fee
+    const totalNeeded = totalOutputValue + transactionFee;
+    let allInputBoxes = inputBoxes;
+    
+    if (totalInputValue < totalNeeded) {
+      // Need additional wallet UTXOs to cover the shortfall
+      const shortfall = totalNeeded - totalInputValue;
+      
+      if (!ergoNode) {
+        throw new Error(`Insufficient value in input boxes. Have: ${totalInputValue}, Need: ${totalNeeded} (shortfall: ${shortfall}). No ergoNode provided to get wallet UTXOs.`);
+      }
+      
+      console.log(`Need additional ${shortfall} nanoErgs from wallet UTXOs`);
+      
+      // Get wallet UTXOs
+      const walletUtxos = await ergoNode.getWalletUtxos(changeAddress);
+      
+      if (walletUtxos.length === 0) {
+        throw new Error(`Insufficient value in input boxes and no wallet UTXOs available. Have: ${totalInputValue}, Need: ${totalNeeded} (shortfall: ${shortfall})`);
+      }
+      
+      // Add wallet UTXOs until we have enough
+      let walletValue = 0n;
+      const additionalInputs = [];
+      
+      for (const utxo of walletUtxos) {
+        additionalInputs.push({
+          boxId: utxo.boxId,
+          transactionId: utxo.transactionId,
+          index: utxo.index,
+          value: utxo.value.toString(),
+          ergoTree: utxo.ergoTree,
+          assets: utxo.assets || [],
+          additionalRegisters: utxo.additionalRegisters || {},
+          creationHeight: utxo.creationHeight
+        });
+        
+        walletValue += BigInt(utxo.value);
+        
+        if (walletValue >= shortfall) {
+          break;
+        }
+      }
+      
+      if (walletValue < shortfall) {
+        throw new Error(`Insufficient wallet UTXOs. Have: ${walletValue}, Need: ${shortfall}`);
+      }
+      
+      allInputBoxes = [...inputBoxes, ...additionalInputs];
+      console.log(`Added ${additionalInputs.length} wallet UTXOs providing ${walletValue} nanoErgs`);
     }
-
-    // Add change output to collect rent fees (minus transaction fee)
+    
+    // The fee will be automatically deducted from inputs by Fleet SDK
+    // So we collect the full rent amount and let the SDK handle fee payment
     const rentCollectionOutput = new OutputBuilder(
-      rentAfterFee.toString(),
+      totalRentCollected.toString(),
       changeAddr
     );
 
     const unsignedTx = new TransactionBuilder(currentHeight)
-      .from(inputBoxes)
+      .from(allInputBoxes)
       .to([...outputs, rentCollectionOutput])
       .sendChangeTo(changeAddr)
       .payFee(RECOMMENDED_MIN_FEE_VALUE)
