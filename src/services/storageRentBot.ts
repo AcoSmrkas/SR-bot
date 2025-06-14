@@ -213,7 +213,43 @@ export class StorageRentBot {
       }
       
       if (nowEligible.length === 0) {
-        this.logger.info('No queued boxes are eligible yet', { component: 'processor' });
+        // Show detailed info about queued boxes and when they'll be eligible
+        if (this.queuedBoxesByHeight.size === 0) {
+          this.logger.info('No boxes in queue - need to perform a queue scan', { component: 'processor' });
+        } else {
+          // Find the next eligible boxes and show when they'll be ready
+          const sortedHeights = Array.from(this.queuedBoxesByHeight.keys()).sort((a, b) => a - b);
+          const nextEligibleHeight = sortedHeights[0];
+          const nextEligibleBoxes = this.queuedBoxesByHeight.get(nextEligibleHeight)!;
+          const claimableAtHeight = nextEligibleHeight + minAge;
+          const blocksUntilClaimable = claimableAtHeight - currentHeight;
+          
+          // Get first few box IDs as examples
+          const exampleBoxIds = nextEligibleBoxes.slice(0, 3).map(box => box.boxId);
+          const totalQueuedBoxes = Array.from(this.queuedBoxesByHeight.values()).reduce((sum, boxes) => sum + boxes.length, 0);
+          
+          this.logger.info('No queued boxes are eligible yet - showing next eligible boxes', { 
+            component: 'processor',
+            currentHeight,
+            cutoffHeight,
+            totalQueuedBoxes,
+            nextEligibleHeight,
+            claimableAtHeight,
+            blocksUntilClaimable,
+            nextEligibleCount: nextEligibleBoxes.length,
+            exampleBoxIds,
+            estimatedTimeMinutes: Math.round(blocksUntilClaimable * 2) // ~2 minutes per block
+          });
+          
+          // Show summary of all queued heights
+          this.logger.info('Queued boxes summary by height:', { component: 'processor' });
+          for (const height of sortedHeights.slice(0, 5)) { // Show first 5 heights
+            const boxes = this.queuedBoxesByHeight.get(height)!;
+            const claimableAt = height + minAge;
+            const blocksUntil = claimableAt - currentHeight;
+            this.logger.info(`  Height ${height}: ${boxes.length} boxes → eligible in ${blocksUntil} blocks`, { component: 'processor' });
+          }
+        }
         
         const emptyResult: ProcessingResult = {
           processedBoxes: 0,
