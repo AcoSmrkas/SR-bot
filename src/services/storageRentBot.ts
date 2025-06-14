@@ -219,8 +219,34 @@ export class StorageRentBot {
         } else {
           // Find the next eligible boxes and show when they'll be ready
           const sortedHeights = Array.from(this.queuedBoxesByHeight.keys()).sort((a, b) => a - b);
-          const nextEligibleHeight = sortedHeights[0];
-          const nextEligibleBoxes = this.queuedBoxesByHeight.get(nextEligibleHeight)!;
+          if (sortedHeights.length === 0) {
+            this.logger.info('Queue exists but is empty', { component: 'processor' });
+            const emptyResult: ProcessingResult = {
+              processedBoxes: 0,
+              successfulTransactions: 0,
+              failedTransactions: 0,
+              totalRentCollected: 0n,
+              totalFeesPaid: 0n,
+              errors: []
+            };
+            return emptyResult;
+          }
+          
+          const nextEligibleHeight = sortedHeights[0]!; // Safe after length check
+          const nextEligibleBoxes = this.queuedBoxesByHeight.get(nextEligibleHeight);
+          if (!nextEligibleBoxes) {
+            this.logger.warn('No boxes found for next eligible height', { component: 'processor', nextEligibleHeight });
+            const emptyResult: ProcessingResult = {
+              processedBoxes: 0,
+              successfulTransactions: 0,
+              failedTransactions: 0,
+              totalRentCollected: 0n,
+              totalFeesPaid: 0n,
+              errors: []
+            };
+            return emptyResult;
+          }
+          
           const claimableAtHeight = nextEligibleHeight + minAge;
           const blocksUntilClaimable = claimableAtHeight - currentHeight;
           
