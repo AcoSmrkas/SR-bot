@@ -1,4 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
+import { estimateBoxSize } from '@fleet-sdk/serializer';
 import { Config, NodeInfo, BoxData, EligibleBox } from '../types';
 
 export class ErgoNodeService {
@@ -147,26 +148,29 @@ export class ErgoNodeService {
     }
   }
 
-  // Calculate box size from box data
+  // Calculate box size using Fleet SDK serialization
   private calculateBoxSize(box: BoxData): number {
-    // Base size: value (8) + ergoTree + creationHeight (4) + tokens + registers
-    let size = 8 + 4; // value + creation height
-    
-    // ErgoTree size (hex string / 2)
-    size += box.ergoTree.length / 2;
-    
-    // Assets size (32 bytes tokenId + 8 bytes amount per asset)
-    size += box.assets.length * 40;
-    
-    // Additional registers size (estimate)
-    for (const [key, value] of Object.entries(box.additionalRegisters || {})) {
-      size += 1 + (value.length / 2); // register key + value
+    try {
+      // Convert BoxData to Fleet SDK Box format
+      const fleetBox = {
+        boxId: box.boxId,
+        value: BigInt(box.value),
+        ergoTree: box.ergoTree,
+        assets: box.assets.map(asset => ({
+          tokenId: asset.tokenId,
+          amount: BigInt(asset.amount)
+        })),
+        additionalRegisters: box.additionalRegisters || {},
+        creationHeight: box.creationHeight
+      };
+      
+      // Use Fleet SDK's accurate box size calculation
+      return estimateBoxSize(fleetBox);
+    } catch (error) {
+      console.warn(`Failed to calculate box size with Fleet SDK for ${box.boxId}:`, error);
+      // Fallback to simple estimate if Fleet SDK fails
+      return 105; // Default "standard box" size from Ergo docs
     }
-    
-    // Add some overhead
-    size += 20;
-    
-    return size;
   }
 
   // Scan for boxes and organize by creation height, with infinite search capability

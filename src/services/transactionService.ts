@@ -1,5 +1,6 @@
 import { EligibleBox, Config, TransactionResult } from '../types';
 import { TransactionBuilder, OutputBuilder, ErgoAddress, RECOMMENDED_MIN_FEE_VALUE } from '@fleet-sdk/core';
+import { estimateBoxSize } from '@fleet-sdk/serializer';
 import * as ergo from 'ergo-lib-wasm-nodejs';
 import axios from 'axios';
 import jsonBigInt from 'json-bigint';
