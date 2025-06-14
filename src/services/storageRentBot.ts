@@ -11,6 +11,9 @@ export class StorageRentBot {
   private database: Database;
   private isRunning: boolean = false;
   private cronJob: cron.ScheduledTask | null = null;
+  private lastQueueScanHeight: number = 0;
+  private queuedBoxesByHeight: Map<number, EligibleBox[]> = new Map();
+  private lastSearchOffset: number = 0;
   private startTime: Date;
   private logger: any; // Will be injected
 
@@ -34,10 +37,6 @@ export class StorageRentBot {
     try {
       this.logger.info('Initializing Storage Rent Bot', { component: 'bot' });
 
-      // Initialize wallet
-      await this.transactionService.initializeWallet();
-      this.logger.info('Wallet initialized successfully', { component: 'bot' });
-
       // Test node connectivity
       const nodeHealthy = await this.ergoNode.healthCheck();
       if (!nodeHealthy) {
@@ -56,7 +55,10 @@ export class StorageRentBot {
       await this.database.setBotState('initialized_at', new Date().toISOString());
       await this.database.setBotState('wallet_address', this.transactionService.getWalletAddress());
 
-      this.logger.info('Storage Rent Bot initialized successfully', { component: 'bot' });
+      this.logger.info('Storage Rent Bot initialized successfully', { 
+        component: 'bot',
+        walletAddress: this.transactionService.getWalletAddress()
+      });
 
     } catch (error) {
       this.logger.error('Failed to initialize Storage Rent Bot', { 
@@ -157,29 +159,97 @@ export class StorageRentBot {
     const startTime = Date.now();
     
     try {
-      this.logger.info('Starting scan and process cycle', { component: 'bot' });
-
+      const currentHeight = await this.ergoNode.getCurrentHeight();
+      
+      // Check if we need to do a full queue scan (every 50 blocks ~1.5 hours)
+      const shouldScanQueue = currentHeight - this.lastQueueScanHeight >= 50;
+      
+      if (shouldScanQueue) {
+        this.logger.info('Starting queue scan cycle', { component: 'bot' });
+        
+        // Do full scan to find new boxes to queue, organized by height
+        const { boxesByHeight, nextOffset } = await this.ergoNode.scanForEligibleBoxes(
+          currentHeight,
+          this.config.minStorageRentAgeBlocks,
+          this.lastSearchOffset,
+          50
+        );
+        
+        // Merge new boxes into our existing queue by height
+        for (const [height, boxes] of boxesByHeight) {
+          if (!this.queuedBoxesByHeight.has(height)) {
+            this.queuedBoxesByHeight.set(height, []);
+          }
+          this.queuedBoxesByHeight.get(height)!.push(...boxes);
+        }
+        
+        this.lastQueueScanHeight = currentHeight;
+        this.lastSearchOffset = nextOffset;
+        
+        const totalQueuedBoxes = Array.from(this.queuedBoxesByHeight.values()).reduce((sum, boxes) => sum + boxes.length, 0);
+        this.logger.info(`Queue scan complete: found ${boxesByHeight.size} height groups with ${totalQueuedBoxes} total boxes queued`, { component: 'bot' });
+      }
+      
+      // Always check if any queued boxes are now eligible
+      this.logger.info('Checking queued boxes for eligibility', { component: 'bot' });
+      
+      const minAge = this.config.minStorageRentAgeBlocks;
+      const cutoffHeight = currentHeight - minAge;
+      
+      // Find all boxes from heights that are now eligible
+      const nowEligible: EligibleBox[] = [];
+      const heightsToRemove: number[] = [];
+      
+      for (const [height, boxes] of this.queuedBoxesByHeight) {
+        if (height <= cutoffHeight) {
+          nowEligible.push(...boxes);
+          heightsToRemove.push(height);
+        }
+      }
+      
+      // Remove processed height groups from queue
+      for (const height of heightsToRemove) {
+        this.queuedBoxesByHeight.delete(height);
+      }
+      
+      if (nowEligible.length === 0) {
+        this.logger.info('No queued boxes are eligible yet', { component: 'processor' });
+        
+        const emptyResult: ProcessingResult = {
+          processedBoxes: 0,
+          successfulTransactions: 0,
+          failedTransactions: 0,
+          totalRentCollected: 0n,
+          totalFeesPaid: 0n,
+          errors: []
+        };
+        return emptyResult;
+      }
+      
+      this.logger.info(`Found ${nowEligible.length} newly eligible boxes from ${heightsToRemove.length} height groups!`, { component: 'processor' });
+      
       // Update wallet balance
       await this.updateWalletBalance();
-
-      // Scan for eligible boxes
-      const scanResult = await this.scanForEligibleBoxes();
       
-      // Process eligible boxes
-      const processingResult = await this.processEligibleBoxes(scanResult.eligibleBoxes);
+      // Process the newly eligible boxes
+      const processingResult = await this.processEligibleBoxes(nowEligible);
 
       // Update metrics
       await this.updateMetrics();
 
+      const totalQueuedBoxes = Array.from(this.queuedBoxesByHeight.values()).reduce((sum, boxes) => sum + boxes.length, 0);
       const duration = Date.now() - startTime;
       this.logger.info('Scan and process cycle completed', {
         component: 'bot',
         duration,
-        scanned: scanResult.totalScanned,
-        eligible: scanResult.eligibleBoxes.length,
+        scanned: 0,
+        eligible: nowEligible.length,
         processed: processingResult.processedBoxes,
         successful: processingResult.successfulTransactions,
-        failed: processingResult.failedTransactions
+        failed: processingResult.failedTransactions,
+        queued: totalQueuedBoxes,
+        queuedHeights: this.queuedBoxesByHeight.size,
+        lastSearchOffset: this.lastSearchOffset
       });
 
       return processingResult;
@@ -195,74 +265,6 @@ export class StorageRentBot {
     }
   }
 
-  // Scan for boxes eligible for storage rent
-  private async scanForEligibleBoxes(): Promise<ScanResult> {
-    const startTime = Date.now();
-    
-    try {
-      this.logger.info('Starting box scan', { component: 'scanner' });
-
-      const currentHeight = await this.ergoNode.getCurrentHeight();
-      const minAge = this.config.minStorageRentAgeBlocks;
-
-      // Scan for eligible boxes
-      const eligibleBoxes = await this.ergoNode.scanForEligibleBoxes(
-        currentHeight,
-        minAge,
-        1000, // batch size
-        20    // max batches
-      );
-
-      // Filter by minimum rent threshold
-      const filteredBoxes = eligibleBoxes.filter(box => 
-        box.rentFee >= BigInt(this.config.minRentThreshold)
-      );
-
-      // Save eligible boxes to database
-      for (const box of filteredBoxes) {
-        try {
-          await this.database.insertEligibleBox(box);
-        } catch (error) {
-          this.logger.warn('Failed to save eligible box to database', {
-            component: 'scanner',
-            boxId: box.boxId,
-            error: error as Error
-          });
-        }
-      }
-
-      // Update scan state
-      await this.database.setBotState('last_scan_height', currentHeight.toString());
-      await this.database.setBotState('last_scan_time', new Date().toISOString());
-
-      const duration = Date.now() - startTime;
-      const result: ScanResult = {
-        eligibleBoxes: filteredBoxes,
-        totalScanned: eligibleBoxes.length,
-        currentHeight,
-        scanDuration: duration
-      };
-
-      this.logger.logScanResult(
-        'Box scan completed',
-        eligibleBoxes.length,
-        filteredBoxes.length,
-        currentHeight,
-        duration
-      );
-
-      return result;
-
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      this.logger.error('Box scan failed', {
-        component: 'scanner',
-        duration,
-        error: error as Error
-      });
-      throw error;
-    }
-  }
 
   // Process eligible boxes by creating and submitting transactions
   private async processEligibleBoxes(eligibleBoxes: EligibleBox[]): Promise<ProcessingResult> {
@@ -403,35 +405,24 @@ export class StorageRentBot {
       const currentHeight = await this.ergoNode.getCurrentHeight();
       const changeAddress = this.transactionService.getWalletAddress();
 
-      // Build transaction
-      const { txBytes, txId, totalRentCollected } = await this.transactionService.buildStorageRentTransaction(
+      // Build transaction using Fleet SDK
+      const { unsignedTx, inputBoxes, totalRentCollected } = await this.transactionService.buildStorageRentTransaction(
         boxes,
         changeAddress,
         currentHeight
       );
 
       // Validate transaction
-      const validation = await this.transactionService.validateTransaction(boxes, txBytes);
+      const validation = await this.transactionService.validateTransaction(boxes, unsignedTx);
       if (!validation.valid) {
         throw new Error(`Transaction validation failed: ${validation.errors.join(', ')}`);
       }
 
       const transactionFee = BigInt(this.config.transactionFee);
 
-      // Create transaction record
-      const transactionResult: TransactionResult = {
-        txId,
-        boxIds: boxes.map(box => box.boxId),
-        totalRentCollected,
-        transactionFee,
-        status: 'pending',
-        createdAt: new Date()
-      };
-
       if (this.config.dryRun) {
         this.logger.info('DRY RUN: Would submit transaction', {
           component: 'processor',
-          txId,
           boxCount: boxes.length,
           rentCollected: totalRentCollected.toString(),
           fee: transactionFee.toString()
@@ -444,16 +435,22 @@ export class StorageRentBot {
         result.totalFeesPaid = transactionFee;
 
       } else {
-        // Submit transaction to network
-        const submittedTxId = await this.ergoNode.submitTransaction(txBytes);
+        // Sign and submit transaction using ergo-lib-wasm
+        const [txId, signedTxJson] = await this.transactionService.fromUnsigned(unsignedTx);
         
-        if (submittedTxId !== txId) {
-          this.logger.warn('Transaction ID mismatch', {
-            component: 'processor',
-            expectedTxId: txId,
-            actualTxId: submittedTxId
-          });
+        if (!txId) {
+          throw new Error('Failed to sign and submit transaction');
         }
+        
+        // Create transaction record
+        const transactionResult: TransactionResult = {
+          txId,
+          boxIds: boxes.map(box => box.boxId),
+          totalRentCollected,
+          transactionFee,
+          status: 'pending',
+          createdAt: new Date()
+        };
 
         // Save transaction to database
         await this.database.insertTransaction(transactionResult);
@@ -464,13 +461,13 @@ export class StorageRentBot {
         }
 
         // Log transaction
-        this.logger.logTransaction(
-          'Storage rent transaction submitted',
+        this.logger.info('Storage rent transaction submitted', {
+          component: 'processor',
           txId,
-          boxes.map(box => box.boxId),
-          totalRentCollected,
-          transactionFee
-        );
+          boxIds: boxes.map(box => box.boxId),
+          rentCollected: totalRentCollected.toString(),
+          fee: transactionFee.toString()
+        });
 
         // Update result
         result.processedBoxes = boxes.length;
@@ -603,6 +600,7 @@ export class StorageRentBot {
       walletAddress: this.transactionService.getWalletAddress()
     };
   }
+
 
   // Cleanup resources
   async cleanup(): Promise<void> {

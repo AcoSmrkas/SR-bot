@@ -19,7 +19,7 @@ export class ErgoNodeService {
     
     this.client = axios.create({
       baseURL: config.ergoNodeUrl,
-      timeout: 30000,
+      timeout: 10000,
       headers,
     });
   }
@@ -82,21 +82,37 @@ export class ErgoNodeService {
     }
   }
 
-  // Register a scan for old boxes
-  async registerStorageRentScan(minHeight: number): Promise<string> {
+  // Register a persistent scan for old boxes (reuse existing scan if available)
+  private scanId: string | null = null;
+  
+  async registerStorageRentScan(cutoffHeight: number): Promise<string> {
+    // Reuse existing scan if available
+    if (this.scanId) {
+      try {
+        // Check if scan still exists by trying to get unspent boxes
+        await this.client.get(`/scan/unspentBoxes/${this.scanId}`);
+        return this.scanId;
+      } catch (error) {
+        // Scan doesn't exist anymore, create new one
+        this.scanId = null;
+      }
+    }
+    
     try {
+      // Use simple scan that should definitely return boxes - we'll filter manually
       const scanRequest = {
-        scanName: `storage-rent-scan-${Date.now()}`,
+        scanName: "storage-rent-simple-scan",
         walletInteraction: "off",
-        removeOffchain: true,
+        removeOffchain: false,
         trackingRule: {
           predicate: "containsAsset",
           assetId: ""
         }
       };
-
+      
       const response = await this.client.post('/scan/register', scanRequest);
-      return response.data.scanId;
+      this.scanId = response.data.scanId;
+      return this.scanId!;
     } catch (error) {
       throw new Error(`Failed to register storage rent scan: ${error}`);
     }
@@ -108,6 +124,10 @@ export class ErgoNodeService {
       const response = await this.client.get(`/scan/unspentBoxes/${scanId}`, {
         params: { minConfirmations: 1, maxItems: limit }
       });
+      console.log(`Scan ${scanId} returned ${response.data.length} boxes`);
+      if (response.data.length > 0) {
+        console.log('First box:', JSON.stringify(response.data[0], null, 2));
+      }
       return response.data;
     } catch (error) {
       throw new Error(`Failed to get unspent boxes from scan: ${error}`);
@@ -149,76 +169,168 @@ export class ErgoNodeService {
     return size;
   }
 
-  // Scan for eligible boxes using the node's scan API
+  // Scan for boxes and organize by creation height, with infinite search capability
   async scanForEligibleBoxes(
     currentHeight: number,
     minAge: number,
-    batchSize: number = 100,
-    maxBatches: number = 20
-  ): Promise<EligibleBox[]> {
-    const eligibleBoxes: EligibleBox[] = [];
+    startOffset: number = 0,
+    targetBoxCount: number = 50
+  ): Promise<{ boxesByHeight: Map<number, EligibleBox[]>, nextOffset: number }> {
+    const boxesByHeight: Map<number, EligibleBox[]> = new Map();
     const cutoffHeight = currentHeight - minAge;
+    let totalBoxesFound = 0;
+    let nextOffset = startOffset;
     
     try {
-      // Register a scan for old boxes
-      const scanId = await this.registerStorageRentScan(cutoffHeight);
+      console.log(`Scanning for boxes. Current height: ${currentHeight}, cutoff: ${cutoffHeight}, startOffset: ${startOffset}`);
       
-      // Wait a moment for the scan to process
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // INFINITE SEARCH: Continue searching until we find enough boxes
+      // Start from a reasonable offset to find boxes around height 495533
+      const batchSize = 1000; // Smaller batch for testing
+      let boxesChecked = 0;
+      let offset = startOffset === 0 ? 44160000 : startOffset; // Start from 10M offset to find recent boxes that will become eligible soon
       
-      // Get unspent boxes from the scan
-      const boxes = await this.getUnspentBoxesFromScan(scanId, batchSize);
-      
-      for (const box of boxes) {
+      while (totalBoxesFound < targetBoxCount) {
         try {
-          // Filter by height - only process boxes older than cutoff
-          if (box.creationHeight > cutoffHeight) {
-            continue;
+          console.log(`Searching box range offset=${offset}, limit=${batchSize}`);
+          
+          // Get box IDs from this range
+          const response = await this.client.get('/blockchain/box/range', {
+            params: { offset: offset, limit: batchSize }
+          });
+          
+          response.data = response.data.reverse();
+
+          const boxIds = response.data;
+          console.log(`Found ${boxIds.length} box IDs in range`);
+          
+          // If no more boxes, we've reached the end
+          if (boxIds.length === 0) {
+            console.log('No more boxes found, ending search');
+            break;
           }
           
-          // Calculate box size and rent fee
-          const boxSize = this.calculateBoxSize(box);
-          const rentFee = BigInt(boxSize * this.config.rentFeePerByte);
-          const boxValue = BigInt(box.value);
-          
-          // Check if box has sufficient value to pay rent
-          if (boxValue >= rentFee + BigInt(this.config.minBoxValuePerByte * boxSize)) {
-            const eligibleBox: EligibleBox = {
-              boxId: box.boxId,
-              creationHeight: box.creationHeight,
-              currentHeight,
-              boxSize,
-              value: boxValue,
-              rentFee,
-              status: 'pending',
-              discoveredAt: new Date(),
-              ergoTree: box.ergoTree,
-              assets: box.assets.map(asset => ({
-                tokenId: asset.tokenId,
-                amount: BigInt(asset.amount)
-              })),
-              additionalRegisters: box.additionalRegisters || {}
-            };
-            
-            eligibleBoxes.push(eligibleBox);
+          // Check each box for eligibility
+          for (const boxId of boxIds) {
+            try {
+              const boxResponse = await this.client.get(`/blockchain/box/byId/${boxId}`);
+              const box = boxResponse.data;
+              boxesChecked++;
+              
+              // Progress logging
+              if (boxesChecked % 10 === 0) {
+                console.log(`Checked ${boxesChecked} boxes. Current: height=${box.creationHeight}, spent=${!!box.spentTransactionId}`);
+              }
+              
+              
+              // Skip if box is spent
+              if (box.spentTransactionId) {
+                continue;
+              }
+              
+              // Find boxes that will become eligible soon (next 1000 blocks) or are already eligible
+              console.log(`Box height: ${box.creationHeight}, cutoff: ${cutoffHeight} minAge: ${minAge}`);
+              const blocksUntilEligible = (cutoffHeight - box.creationHeight);
+              
+              // Debug unspent boxes
+              if (boxesChecked % 100 === 0) {
+                console.log(`UNSPENT box ${boxId}: height=${box.creationHeight}, blocksUntil=${blocksUntilEligible}, cutoff=${cutoffHeight}`);
+              }
+              
+              // Skip if too far in future (>1000 blocks)
+              if (blocksUntilEligible > 0) {
+                continue;
+              }
+              
+              console.log(`Found eligible/future box: ${boxId}, height: ${box.creationHeight}, eligible in ${blocksUntilEligible} blocks`);
+              
+              // Calculate box size and rent fee  
+              const boxSize = this.calculateBoxSize(box);
+              const rentFee = BigInt(boxSize * this.config.rentFeePerByte);
+              const boxValue = BigInt(box.value);
+              
+              console.log(`Box value check: ${boxValue} >= ${rentFee + BigInt(this.config.minBoxValuePerByte * boxSize)}`);
+              
+              // Check if box has sufficient value to pay rent
+              if (boxValue >= rentFee + BigInt(this.config.minBoxValuePerByte * boxSize)) {
+                const eligibleBox: EligibleBox = {
+                  boxId: box.boxId,
+                  creationHeight: box.creationHeight,
+                  currentHeight,
+                  boxSize,
+                  value: boxValue,
+                  rentFee,
+                  status: blocksUntilEligible <= 0 ? 'pending' : 'queued',
+                  discoveredAt: new Date(),
+                  ergoTree: box.ergoTree,
+                  assets: box.assets ? box.assets.map((asset: any) => ({
+                    tokenId: asset.tokenId,
+                    amount: BigInt(asset.amount)
+                  })) : [],
+                  additionalRegisters: box.additionalRegisters || {}
+                };
+                
+                // Organize by creation height
+                const height = box.creationHeight;
+                if (!boxesByHeight.has(height)) {
+                  boxesByHeight.set(height, []);
+                }
+                boxesByHeight.get(height)!.push(eligibleBox);
+                totalBoxesFound++;
+                
+                // Calculate when this box will be claimable
+                const claimableAtHeight = box.creationHeight + minAge;
+                const blocksUntilClaimable = claimableAtHeight - currentHeight;
+                
+                console.log(`*** ADDED box to height ${height}: ${boxId}, value: ${boxValue} ***`);
+                console.log(`*** Box will be claimable at height ${claimableAtHeight} (in ${blocksUntilClaimable} blocks) ***`);
+                
+                // Check if we have enough boxes
+                if (totalBoxesFound >= targetBoxCount) {
+                  console.log(`Found ${totalBoxesFound} boxes organized by height, stopping search`);
+                  nextOffset = offset - (batchSize - boxIds.indexOf(boxId));
+                  return { boxesByHeight, nextOffset };
+                }
+              } else {
+                console.log(`Box ${boxId} insufficient value: ${boxValue} < ${rentFee + BigInt(this.config.minBoxValuePerByte * boxSize)}`);
+              }
+              
+            } catch (error) {
+              console.warn(`Error checking box ${boxId}:`, error);
+            }
           }
+          
+          // Move to next batch
+          offset -= batchSize;
+          nextOffset = offset;
+          
         } catch (error) {
-          console.warn(`Error processing box ${box.boxId}:`, error);
+          console.warn(`Error searching range ${offset}-${offset + batchSize}:`, error);
+          offset -= batchSize;
+          nextOffset = offset;
         }
       }
       
-      // Clean up the scan
-      try {
-        await this.client.post(`/scan/deregister`, { scanId });
-      } catch (error) {
-        console.warn(`Failed to deregister scan ${scanId}:`, error);
+      console.log(`Search complete: found ${totalBoxesFound} boxes organized into ${boxesByHeight.size} height groups from ${boxesChecked} boxes checked`);
+      
+      // Show next claimable boxes summary
+      if (boxesByHeight.size > 0) {
+        console.log('\n=== NEXT CLAIMABLE BOXES ===');
+        const sortedHeights = Array.from(boxesByHeight.keys()).sort((a, b) => a - b);
+        for (const height of sortedHeights) {
+          const boxes = boxesByHeight.get(height)!;
+          const claimableAtHeight = height + minAge;
+          const blocksUntilClaimable = claimableAtHeight - currentHeight;
+          console.log(`Height ${height}: ${boxes.length} boxes → claimable at height ${claimableAtHeight} (in ${blocksUntilClaimable} blocks)`);
+        }
+        console.log('===============================\n');
       }
       
     } catch (error) {
       throw new Error(`Failed to scan for eligible boxes: ${error}`);
     }
     
-    return eligibleBoxes;
+    return { boxesByHeight, nextOffset };
   }
 
   // Validate boxes are still unspent

@@ -1,11 +1,37 @@
 #!/usr/bin/env node
 
+console.log('Script starting...');
+
+try {
+  console.log('Importing modules...');
+} catch (error) {
+  console.error('Error during imports:', error);
+  process.exit(1);
+}
+
+console.log('Importing config...');
 import { getConfig } from './config';
+console.log('Config imported successfully');
+
+console.log('Importing logger...');
 import { createLogger, getLogger } from './utils/logger';
+console.log('Logger imported successfully');
+
+console.log('Importing database...');
 import { createDatabase } from './database';
+console.log('Database imported successfully');
+
+console.log('Importing ErgoNodeService...');
 import { ErgoNodeService } from './services/ergoNode';
+console.log('ErgoNodeService imported successfully');
+
+console.log('Importing TransactionService...');
 import { TransactionService } from './services/transactionService';
+console.log('TransactionService imported successfully');
+
+console.log('Importing StorageRentBot...');
 import { StorageRentBot } from './services/storageRentBot';
+console.log('StorageRentBot imported successfully');
 
 // Global instances
 let bot: StorageRentBot | null = null;
@@ -115,20 +141,32 @@ async function showStatus(): Promise<void> {
 // Main function
 async function main(): Promise<void> {
   try {
+    console.log('Starting main function...');
+    
     // Setup signal handlers
     setupSignalHandlers();
+    console.log('Signal handlers setup complete');
 
     // Check for status command
     if (process.env.NODE_ENV === 'status') {
+      console.log('Running status command...');
       await showStatus();
       return;
     }
 
+    console.log('Loading configuration...');
     // Load configuration
     const config = getConfig();
+    console.log('Configuration loaded successfully');
+    console.log('Config:', { 
+      ergoNodeUrl: config.ergoNodeUrl,
+      networkType: config.networkType,
+      dryRun: config.dryRun 
+    });
     
     // Initialize logger
     logger = createLogger(config.logLevel, config.logDir);
+    console.log('Logger initialized');
     logger.info('Starting SR-bot', { 
       component: 'main',
       version: '1.0.0',
@@ -136,35 +174,48 @@ async function main(): Promise<void> {
       dryRun: config.dryRun
     });
 
+    console.log('Initializing database...');
     // Initialize database
     const database = createDatabase(config.databasePath);
+    console.log('Database initialized');
     logger.info('Database initialized', { component: 'main' });
 
+    console.log('Initializing Ergo node service...');
     // Initialize Ergo node service
     const ergoNode = new ErgoNodeService(config);
+    console.log('Ergo node service initialized');
     logger.info('Ergo node service initialized', { component: 'main' });
 
+    console.log('Initializing transaction service...');
     // Initialize transaction service
     const transactionService = new TransactionService(config);
+    console.log('Transaction service initialized');
     logger.info('Transaction service initialized', { component: 'main' });
 
+    console.log('Initializing storage rent bot...');
     // Initialize storage rent bot
     bot = new StorageRentBot(config, ergoNode, transactionService, database, logger);
     
+    console.log('Starting bot initialization...');
     // Initialize and start the bot
     await bot.initialize();
+    console.log('Bot initialization complete, starting bot...');
     await bot.start();
+    console.log('Bot started successfully');
 
     // Keep the process running
+    console.log('SR-bot is running. Press Ctrl+C to stop.');
     logger.info('SR-bot is running. Press Ctrl+C to stop.', { component: 'main' });
 
     // In dry-run mode, run once and exit
     if (config.dryRun || process.env.NODE_ENV === 'dry-run') {
+      console.log('Dry-run mode detected, exiting...');
       logger.info('Dry-run completed, exiting...', { component: 'main' });
       await gracefulShutdown('dry-run-complete');
     }
 
   } catch (error) {
+    console.error('Error in main function:', error);
     if (logger) {
       logger.error('Failed to start SR-bot', { component: 'main', error: error as Error });
     } else {

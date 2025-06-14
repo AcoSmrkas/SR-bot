@@ -50,7 +50,7 @@ export interface EligibleBox {
   boxSize: number;
   value: bigint;
   rentFee: bigint;
-  status: 'pending' | 'claimed' | 'insufficient_funds' | 'error';
+  status: 'pending' | 'queued' | 'claimed' | 'insufficient_funds' | 'error';
   discoveredAt: Date;
   claimedAt?: Date;
   txId?: string;
