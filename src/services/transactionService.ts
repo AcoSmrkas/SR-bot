@@ -97,16 +97,34 @@ export class TransactionService {
     // Calculate transaction fee
     const transactionFee = BigInt(RECOMMENDED_MIN_FEE_VALUE);
     
-    // Check if inputs cover outputs + fee
-    const totalNeeded = totalOutputValue + transactionFee;
+    // LOG DETAILED BREAKDOWN
+    console.log('\n=== TRANSACTION CALCULATION ===');
+    console.log(`Total input value: ${totalInputValue} nanoErgs`);
+    console.log(`Total output value: ${totalOutputValue} nanoErgs`);
+    console.log(`  - New boxes total: ${boxes.reduce((sum, box) => sum + (box.value - box.rentFee), 0n)} nanoErgs`);
+    console.log(`  - Rent collected: ${totalRentCollected} nanoErgs`);
+    console.log(`Transaction fee: ${transactionFee} nanoErgs`);
+    console.log(`Input - Output: ${totalInputValue - totalOutputValue} nanoErgs (should cover fee)`);
+    console.log(`Box count: ${boxes.length}`);
+    boxes.forEach((box, i) => {
+      console.log(`  Box ${i}: input=${box.value}, output=${box.value - box.rentFee}, rent=${box.rentFee}`);
+    });
+    console.log('===============================\n');
+    
+    // The math should be: inputs = outputs + fee
+    // So: totalInputValue = totalOutputValue + transactionFee
+    // Which means: totalInputValue - totalOutputValue should >= transactionFee
+    const availableForFee = totalInputValue - totalOutputValue;
+    console.log(`Available for fee: ${availableForFee} nanoErgs, needed: ${transactionFee} nanoErgs`);
+    
     let allInputBoxes = inputBoxes;
     
-    if (totalInputValue < totalNeeded) {
+    if (availableForFee < transactionFee) {
       // Need additional wallet UTXOs to cover the shortfall
-      const shortfall = totalNeeded - totalInputValue;
+      const shortfall = transactionFee - availableForFee;
       
       if (!ergoNode) {
-        throw new Error(`Insufficient value in input boxes. Have: ${totalInputValue}, Need: ${totalNeeded} (shortfall: ${shortfall}). No ergoNode provided to get wallet UTXOs.`);
+        throw new Error(`Insufficient fee available from claimed boxes. Available: ${availableForFee}, Need: ${transactionFee} (shortfall: ${shortfall}). No ergoNode provided to get wallet UTXOs.`);
       }
       
       console.log(`Need additional ${shortfall} nanoErgs from wallet UTXOs`);
@@ -115,7 +133,7 @@ export class TransactionService {
       const walletUtxos = await ergoNode.getWalletUtxos(changeAddress);
       
       if (walletUtxos.length === 0) {
-        throw new Error(`Insufficient value in input boxes and no wallet UTXOs available. Have: ${totalInputValue}, Need: ${totalNeeded} (shortfall: ${shortfall})`);
+        throw new Error(`Insufficient fee available from claimed boxes and no wallet UTXOs available. Fee available: ${availableForFee}, Fee needed: ${transactionFee} (shortfall: ${shortfall})`);
       }
       
       // Add wallet UTXOs until we have enough
