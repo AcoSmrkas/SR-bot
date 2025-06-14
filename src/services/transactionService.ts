@@ -1,5 +1,5 @@
 import { EligibleBox, Config, TransactionResult } from '../types';
-import { TransactionBuilder, OutputBuilder, ErgoAddress, RECOMMENDED_MIN_FEE_VALUE } from '@fleet-sdk/core';
+import { TransactionBuilder, OutputBuilder, ErgoAddress, RECOMMENDED_MIN_FEE_VALUE, ErgoUnsignedInput } from '@fleet-sdk/core';
 import { estimateBoxSize } from '@fleet-sdk/serializer';
 import * as ergo from 'ergo-lib-wasm-nodejs';
 import axios from 'axios';
@@ -55,20 +55,29 @@ export class TransactionService {
       totalRentCollected += box.rentFee;
     }
 
-    // Get actual box data from the node for Fleet SDK
-    const inputBoxes = [];
-    for (const box of boxes) {
-      console.log(`Fetching box data from node: ${box.boxId}`);
+    // Create Fleet SDK inputs with context extensions for storage rent
+    const fleetInputs = [];
+    for (let i = 0; i < boxes.length; i++) {
+      const box = boxes[i]!; // Non-null assertion since we're iterating through boxes array
+      console.log(`Creating Fleet SDK input for box: ${box.boxId}`);
+      
       try {
         const nodeBoxData = await ergoNode.getBoxById(box.boxId);
         if (!nodeBoxData) {
           throw new Error(`Box ${box.boxId} not found or already spent`);
         }
         
-        console.log(`Got box data:`, JSON.stringify(nodeBoxData, null, 2));
-        inputBoxes.push(nodeBoxData);
+        // Create Fleet SDK input
+        const fleetInput = new ErgoUnsignedInput(nodeBoxData);
+        
+        // Set context extension: variable 127 = output index (hex encoded)
+        const outputIndex = i.toString(16).padStart(2, '0'); // Convert to 2-digit hex
+        fleetInput.setContextExtension({ 127: `03${outputIndex}` }); // 03 prefix + hex index
+        
+        console.log(`Set context extension for input ${i}: { 127: "03${outputIndex}" }`);
+        fleetInputs.push(fleetInput);
       } catch (error) {
-        throw new Error(`Failed to get box data for ${box.boxId}: ${error}`);
+        throw new Error(`Failed to create Fleet SDK input for ${box.boxId}: ${error}`);
       }
     }
 
@@ -121,55 +130,12 @@ export class TransactionService {
     const availableForFee = totalInputValue - totalOutputValue;
     console.log(`Available for fee: ${availableForFee} nanoErgs, needed: ${transactionFee} nanoErgs`);
     
-    let allInputBoxes = inputBoxes;
-    
+    // For now, only use the storage rent boxes - wallet UTXO support can be added later
     if (availableForFee < transactionFee) {
-      // Need additional wallet UTXOs to cover the shortfall
-      const shortfall = transactionFee - availableForFee;
-      
-      if (!ergoNode) {
-        throw new Error(`Insufficient fee available from claimed boxes. Available: ${availableForFee}, Need: ${transactionFee} (shortfall: ${shortfall}). No ergoNode provided to get wallet UTXOs.`);
-      }
-      
-      console.log(`Need additional ${shortfall} nanoErgs from wallet UTXOs`);
-      
-      // Get wallet UTXOs
-      const walletUtxos = await ergoNode.getWalletUtxos(changeAddress);
-      
-      if (walletUtxos.length === 0) {
-        throw new Error(`Insufficient fee available from claimed boxes and no wallet UTXOs available. Fee available: ${availableForFee}, Fee needed: ${transactionFee} (shortfall: ${shortfall})`);
-      }
-      
-      // Add wallet UTXOs until we have enough
-      let walletValue = 0n;
-      const additionalInputs = [];
-      
-      for (const utxo of walletUtxos) {
-        additionalInputs.push({
-          boxId: utxo.boxId,
-          transactionId: utxo.transactionId,
-          index: utxo.index,
-          value: utxo.value.toString(),
-          ergoTree: utxo.ergoTree,
-          assets: utxo.assets || [],
-          additionalRegisters: utxo.additionalRegisters || {},
-          creationHeight: utxo.creationHeight
-        });
-        
-        walletValue += BigInt(utxo.value);
-        
-        if (walletValue >= shortfall) {
-          break;
-        }
-      }
-      
-      if (walletValue < shortfall) {
-        throw new Error(`Insufficient wallet UTXOs. Have: ${walletValue}, Need: ${shortfall}`);
-      }
-      
-      allInputBoxes = [...inputBoxes, ...additionalInputs];
-      console.log(`Added ${additionalInputs.length} wallet UTXOs providing ${walletValue} nanoErgs`);
+      throw new Error(`Insufficient fee available from claimed boxes. Available: ${availableForFee}, Need: ${transactionFee}. Wallet UTXO support not implemented yet.`);
     }
+    
+    const allInputBoxes = fleetInputs;
     
     // Check if we have enough rent to pay the fee
     if (rentAfterFee <= 0n) {
@@ -181,30 +147,21 @@ export class TransactionService {
       changeAddr
     );
 
-    // Fleet SDK automatically includes currentHeight in context extension for storage rent validation
+    // Build storage rent transaction with Fleet SDK inputs containing context extensions
     const unsignedTx = new TransactionBuilder(currentHeight)
-      .from(allInputBoxes)
+      .from(fleetInputs) // Use Fleet SDK inputs with context extensions
       .to([...outputs, rentCollectionOutput])
       .sendChangeTo(changeAddr)
       .payFee(RECOMMENDED_MIN_FEE_VALUE)
       .build()
       .toEIP12Object();
     
-    // Add storage rent context extension: variable #127 = index of recreated boxes
-    // For each input box, we create a corresponding output box at the same index
-    // Variable 127 should contain indices of all recreated boxes
-    const recreatedIndices = boxes.map((_, index) => index);
-    
-    // Add context extension manually since Fleet SDK doesn't expose this
-    (unsignedTx as any).contextExtension = {
-      "127": recreatedIndices.join(",") // Comma-separated indices of recreated boxes
-    };
-    
-    console.log(`Added storage rent context extension: variable 127 = "${recreatedIndices.join(",")}"`);
+    console.log('Built storage rent transaction with context extensions on inputs');
+    console.log('Transaction inputs:', unsignedTx.inputs?.length || 0);
 
     return {
       unsignedTx,
-      inputBoxes,
+      inputBoxes: fleetInputs, // Return Fleet SDK inputs
       totalRentCollected
     };
   }
