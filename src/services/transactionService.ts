@@ -188,6 +188,18 @@ export class TransactionService {
       .payFee(RECOMMENDED_MIN_FEE_VALUE)
       .build()
       .toEIP12Object();
+    
+    // Add storage rent context extension: variable #127 = index of recreated boxes
+    // For each input box, we create a corresponding output box at the same index
+    // Variable 127 should contain indices of all recreated boxes
+    const recreatedIndices = boxes.map((_, index) => index);
+    
+    // Add context extension manually since Fleet SDK doesn't expose this
+    (unsignedTx as any).contextExtension = {
+      "127": recreatedIndices.join(",") // Comma-separated indices of recreated boxes
+    };
+    
+    console.log(`Added storage rent context extension: variable 127 = "${recreatedIndices.join(",")}"`);
 
     return {
       unsignedTx,
