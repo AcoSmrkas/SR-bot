@@ -54,20 +54,22 @@ export class TransactionService {
       totalRentCollected += box.rentFee;
     }
 
-    // Convert eligible boxes to Fleet SDK format
-    const inputBoxes = boxes.map((box, index) => ({
-      boxId: box.boxId,
-      transactionId: box.boxId.substring(0, 64), // Extract transaction ID
-      index: 0, // Assume index 0 for now
-      value: box.value.toString(),
-      ergoTree: box.ergoTree,
-      assets: box.assets.map(asset => ({
-        tokenId: asset.tokenId,
-        amount: asset.amount.toString()
-      })),
-      additionalRegisters: box.additionalRegisters,
-      creationHeight: box.creationHeight
-    }));
+    // Get actual box data from the node for Fleet SDK
+    const inputBoxes = [];
+    for (const box of boxes) {
+      console.log(`Fetching box data from node: ${box.boxId}`);
+      try {
+        const nodeBoxData = await ergoNode.getBoxById(box.boxId);
+        if (!nodeBoxData) {
+          throw new Error(`Box ${box.boxId} not found or already spent`);
+        }
+        
+        console.log(`Got box data:`, JSON.stringify(nodeBoxData, null, 2));
+        inputBoxes.push(nodeBoxData);
+      } catch (error) {
+        throw new Error(`Failed to get box data for ${box.boxId}: ${error}`);
+      }
+    }
 
     // Build transaction using Fleet SDK
     const changeAddr = ErgoAddress.fromBase58(changeAddress);
