@@ -70,7 +70,8 @@ export class TransactionService {
         const fleetInput = new ErgoUnsignedInput(nodeBoxData);
         
         // Set context extension: variable 127 = output index (hex encoded)
-        const outputIndex = i.toString(16).padStart(2, '0'); // Convert to 2-digit hex
+        // Use their pattern: even indices only (input_index * 2)
+        const outputIndex = (i * 2).toString(16).padStart(2, '0'); // Convert to 2-digit hex
         fleetInput.setContextExtension({ 127: `03${outputIndex}` }); // 03 prefix + hex index
         
         console.log(`Set context extension for input ${i}: { 127: "03${outputIndex}" }`);
@@ -93,7 +94,8 @@ export class TransactionService {
         tokenId: asset.tokenId,
         amount: asset.amount.toString()
       })))
-      .setAdditionalRegisters(box.additionalRegisters);
+      .setAdditionalRegisters(box.additionalRegisters)
+      .setCreationHeight(currentHeight + 1); // Set to current height + 1 for recreated boxes
     });
 
     // Calculate total input value
@@ -169,6 +171,9 @@ export class TransactionService {
 
   // Create signed transaction for storage rent (no actual signing needed)
   private createStorageRentSignedTx(unsignedTxJson: any): any {
+    console.log(unsignedTxJson);
+
+    const txId = ergo.UnsignedTransaction.from_json(jsonBigInt.stringify(unsignedTxJson)).id().to_str();
     // For storage rent claims, inputs have empty proofBytes but keep context extensions
     const signedInputs = unsignedTxJson.inputs.map((input: any) => ({
       boxId: input.boxId,
@@ -177,20 +182,21 @@ export class TransactionService {
         extension: input.extension || {} // Keep context extension
       }
     }));
-
+    
     const signedTxJson = {
-      id: unsignedTxJson.id,
+      id: txId,
       inputs: signedInputs,
       dataInputs: unsignedTxJson.dataInputs || [],
-      outputs: unsignedTxJson.outputs
+      outputs: unsignedTxJson.outputs // Keep outputs exactly as-is
     };
 
     console.log('=== STORAGE RENT SIGNED TRANSACTION ===');
     console.log(JSON.stringify(signedTxJson, null, 4));
     console.log('=======================================');
 
-    return ergo.Transaction.from_json(jsonBigInt.stringify(signedTxJson));
+    return jsonBigInt.stringify(unsignedTxJson);
   }
+
 
   // Sign transaction with wallet mnemonic
   private async signTx(unsignedTx: any, inputs: any): Promise<any> {
@@ -210,7 +216,6 @@ export class TransactionService {
   // Send transaction to network
   private async sendTx(signedTx: any): Promise<string> {
     const url = this.config.ergoNodeUrl + '/transactions';
-    const data = signedTx.to_json();
     
     const headers: any = {
       'Accept': 'application/json',
@@ -222,7 +227,7 @@ export class TransactionService {
       headers['api_key'] = this.config.ergoNodeApiKey;
     }
 
-    const response = await axios.post(url, data, { headers });
+    const response = await axios.post(url, signedTx, { headers });
     return response.data;
   }
 
