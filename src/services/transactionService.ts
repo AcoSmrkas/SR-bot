@@ -156,8 +156,9 @@ export class TransactionService {
       .build()
       .toEIP12Object();
     
-    console.log('Built storage rent transaction with context extensions on inputs');
-    console.log('Transaction inputs:', unsignedTx.inputs?.length || 0);
+    console.log('=== FLEET SDK BUILT TRANSACTION ===');
+    console.log(JSON.stringify(unsignedTx, null, 4));
+    console.log('===================================');
 
     return {
       unsignedTx,
@@ -169,7 +170,9 @@ export class TransactionService {
   // Sign and submit transaction using ergo-lib-wasm (fromUnsigned function)
   async fromUnsigned(unsignedTxJson: any): Promise<[string | null, any]> {
     try {
-      console.log(unsignedTxJson)
+      console.log('=== UNSIGNED TRANSACTION DETAILS ===');
+      console.log(JSON.stringify(unsignedTxJson, null, 4));
+      console.log('=====================================');
 
       const unsignedTx = ergo.UnsignedTransaction.from_json(jsonBigInt.stringify(unsignedTxJson));
       
