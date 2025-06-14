@@ -1,6 +1,5 @@
-import { EligibleBox, Config, TransactionResult } from '../types';
+import { EligibleBox, Config } from '../types';
 import { TransactionBuilder, OutputBuilder, ErgoAddress, RECOMMENDED_MIN_FEE_VALUE, ErgoUnsignedInput } from '@fleet-sdk/core';
-import { estimateBoxSize } from '@fleet-sdk/serializer';
 import * as ergo from 'ergo-lib-wasm-nodejs';
 import axios from 'axios';
 import jsonBigInt from 'json-bigint';
@@ -80,9 +79,6 @@ export class TransactionService {
         throw new Error(`Failed to create Fleet SDK input for ${box.boxId}: ${error}`);
       }
     }
-
-    // Build transaction using Fleet SDK
-    const changeAddr = ErgoAddress.fromBase58(changeAddress);
     
     // Create outputs for each box (preserving content but collecting rent)
     const outputs = boxes.map(box => {
@@ -135,30 +131,16 @@ export class TransactionService {
       throw new Error(`Insufficient fee available from claimed boxes. Available: ${availableForFee}, Need: ${transactionFee}. Wallet UTXO support not implemented yet.`);
     }
     
-    const allInputBoxes = fleetInputs;
-    
-    // Check if we have enough rent to pay the fee
-    if (rentAfterFee <= 0n) {
-      throw new Error(`Not enough rent collected to pay transaction fee. Rent: ${totalRentCollected}, Fee: ${transactionFee}`);
-    }
-    
-    const rentCollectionOutput = new OutputBuilder(
-      rentAfterFee.toString(),
-      changeAddr
-    );
+    // Send all collected rent directly to miners via fee (no rent collection for ourselves)
+    console.log(`Sending all collected rent (${totalRentCollected} nanoErgs) to miners via transaction fee`);
 
-    // Build storage rent transaction with Fleet SDK inputs containing context extensions
+    // Build storage rent transaction - all rent goes to miners, no rent collection output
     const unsignedTx = new TransactionBuilder(currentHeight)
       .from(fleetInputs) // Use Fleet SDK inputs with context extensions
-      .to([...outputs, rentCollectionOutput])
-      .sendChangeTo(changeAddr)
-      .payFee(RECOMMENDED_MIN_FEE_VALUE)
+      .to(outputs) // Only recreated boxes, no rent collection
+      .payFee(totalRentCollected.toString()) // Pay ALL collected rent as fee to miners
       .build()
       .toEIP12Object();
-    
-    console.log('=== FLEET SDK BUILT TRANSACTION ===');
-    console.log(JSON.stringify(unsignedTx, null, 4));
-    console.log('===================================');
 
     return {
       unsignedTx,
@@ -174,11 +156,8 @@ export class TransactionService {
       console.log(JSON.stringify(unsignedTxJson, null, 4));
       console.log('=====================================');
 
-      const unsignedTx = ergo.UnsignedTransaction.from_json(jsonBigInt.stringify(unsignedTxJson));
-      
-      const inputBoxes = ergo.ErgoBoxes.from_boxes_json(unsignedTxJson.inputs);
-      
-      const signedTx = await this.signTx(unsignedTx, inputBoxes);
+      // For storage rent transactions, create signed transaction manually with empty proofs
+      const signedTx = this.createStorageRentSignedTx(unsignedTxJson);
       const txId = await this.sendTx(signedTx);
       
       return [txId, jsonBigInt.parse(signedTx.to_json())];
@@ -186,6 +165,31 @@ export class TransactionService {
       console.error(e);
       return [null, null];
     }
+  }
+
+  // Create signed transaction for storage rent (no actual signing needed)
+  private createStorageRentSignedTx(unsignedTxJson: any): any {
+    // For storage rent claims, inputs have empty proofBytes but keep context extensions
+    const signedInputs = unsignedTxJson.inputs.map((input: any) => ({
+      boxId: input.boxId,
+      spendingProof: {
+        proofBytes: "", // Empty proof for storage rent
+        extension: input.extension || {} // Keep context extension
+      }
+    }));
+
+    const signedTxJson = {
+      id: unsignedTxJson.id,
+      inputs: signedInputs,
+      dataInputs: unsignedTxJson.dataInputs || [],
+      outputs: unsignedTxJson.outputs
+    };
+
+    console.log('=== STORAGE RENT SIGNED TRANSACTION ===');
+    console.log(JSON.stringify(signedTxJson, null, 4));
+    console.log('=======================================');
+
+    return ergo.Transaction.from_json(jsonBigInt.stringify(signedTxJson));
   }
 
   // Sign transaction with wallet mnemonic

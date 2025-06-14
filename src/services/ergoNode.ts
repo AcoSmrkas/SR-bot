@@ -148,29 +148,29 @@ export class ErgoNodeService {
     }
   }
 
-  // Calculate box size using Fleet SDK serialization
+  // Calculate box size using Fleet SDK estimation
   private calculateBoxSize(box: BoxData): number {
     try {
-      // Convert BoxData to Fleet SDK Box format
-      const fleetBox = {
-        boxId: box.boxId,
-        value: BigInt(box.value),
-        ergoTree: box.ergoTree,
-        assets: box.assets.map(asset => ({
-          tokenId: asset.tokenId,
-          amount: BigInt(asset.amount)
-        })),
-        additionalRegisters: box.additionalRegisters || {},
-        creationHeight: box.creationHeight
-      };
+      // Use Fleet SDK estimateBoxSize - the official Ergo library
+      const fleetSize = estimateBoxSize(box);
       
-      // Use Fleet SDK's accurate box size calculation
-      return estimateBoxSize(fleetBox);
+      console.log(`Box ${box.boxId}: Fleet SDK size=${fleetSize} bytes, rent=${fleetSize * 1250000} nanoErgs`);
+      
+      return fleetSize;
     } catch (error) {
-      console.warn(`Failed to calculate box size with Fleet SDK for ${box.boxId}:`, error);
-      // Fallback to simple estimate if Fleet SDK fails
-      return 105; // Default "standard box" size from Ergo docs
+      console.warn(`Failed to calculate box size for ${box.boxId}:`, error);
+      // Fallback to standard box size
+      return 49;
     }
+  }
+
+  // Estimate VLQ (Variable Length Quantity) encoding size
+  private estimateVLQSize(value: number): number {
+    if (value < 128) return 1;
+    if (value < 16384) return 2;  
+    if (value < 2097152) return 3;
+    if (value < 268435456) return 4;
+    return 5;
   }
 
   // Scan for boxes and organize by creation height, with infinite search capability
