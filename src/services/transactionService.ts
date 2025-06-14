@@ -69,12 +69,12 @@ export class TransactionService {
         // Create Fleet SDK input
         const fleetInput = new ErgoUnsignedInput(nodeBoxData);
         
-        // Set context extension: variable 127 = output index (hex encoded)
+        // Set context extension: variable 0x7f (127 decimal) = output index (hex encoded)
         // Use their pattern: even indices only (input_index * 2)
         const outputIndex = (i * 2).toString(16).padStart(2, '0'); // Convert to 2-digit hex
-        fleetInput.setContextExtension({ 127: `03${outputIndex}` }); // 03 prefix + hex index
+        fleetInput.setContextExtension({ 0x7f: `03${outputIndex}` }); // Storage rent key 0x7f + 03 prefix + hex index
         
-        console.log(`Set context extension for input ${i}: { 127: "03${outputIndex}" }`);
+        console.log(`Set context extension for input ${i}: { 0x7f: "03${outputIndex}" }`);
         fleetInputs.push(fleetInput);
       } catch (error) {
         throw new Error(`Failed to create Fleet SDK input for ${box.boxId}: ${error}`);
@@ -162,7 +162,7 @@ export class TransactionService {
       const signedTx = this.createStorageRentSignedTx(unsignedTxJson);
       const txId = await this.sendTx(signedTx);
       
-      return [txId, jsonBigInt.parse(signedTx.to_json())];
+      return [txId, signedTx];
     } catch (e) {
       console.error(e);
       return [null, null];
@@ -194,7 +194,7 @@ export class TransactionService {
     console.log(JSON.stringify(signedTxJson, null, 4));
     console.log('=======================================');
 
-    return jsonBigInt.stringify(unsignedTxJson);
+    return jsonBigInt.stringify(signedTxJson);
   }
 
 
