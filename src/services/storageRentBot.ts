@@ -250,11 +250,11 @@ export class StorageRentBot {
           const claimableAtHeight = nextEligibleHeight + minAge;
           const blocksUntilClaimable = claimableAtHeight - currentHeight;
           
-          // Get first few box IDs as examples
-          const exampleBoxIds = nextEligibleBoxes.slice(0, 3).map(box => box.boxId);
+          // Get next eligible box IDs
+          const nextEligibleBoxIds = nextEligibleBoxes.slice(0, 5).map(box => box.boxId);
           const totalQueuedBoxes = Array.from(this.queuedBoxesByHeight.values()).reduce((sum, boxes) => sum + boxes.length, 0);
           
-          this.logger.info('No queued boxes are eligible yet - showing next eligible boxes', { 
+          this.logger.info(`NEXT ELIGIBLE BOXES: ${nextEligibleBoxes.length} boxes at height ${nextEligibleHeight} will be claimable in ${blocksUntilClaimable} blocks (~${Math.round(blocksUntilClaimable * 2)} min)`, { 
             component: 'processor',
             currentHeight,
             cutoffHeight,
@@ -263,9 +263,12 @@ export class StorageRentBot {
             claimableAtHeight,
             blocksUntilClaimable,
             nextEligibleCount: nextEligibleBoxes.length,
-            exampleBoxIds,
+            nextEligibleBoxIds,
             estimatedTimeMinutes: Math.round(blocksUntilClaimable * 2) // ~2 minutes per block
           });
+          
+          // Show the actual box IDs more prominently
+          this.logger.info(`Next eligible box IDs: ${nextEligibleBoxIds.join(', ')}${nextEligibleBoxes.length > 5 ? ` ...and ${nextEligibleBoxes.length - 5} more` : ''}`, { component: 'processor' });
           
           // Show summary of all queued heights
           this.logger.info('Queued boxes summary by height:', { component: 'processor' });
