@@ -9,6 +9,7 @@ export class ErgoNodeService {
   private config: Config;
   private socket: Socket | null = null;
   private currentBlockInfo: NodeInfo | null = null;
+  private blockNotificationCallbacks: ((blockInfo: NodeInfo) => void)[] = [];
 
   constructor(config: Config) {
     this.config = config;
@@ -55,7 +56,20 @@ export class ErgoNodeService {
 
     this.socket.on('info', (info: NodeInfo) => {
       console.log('Received block info update:', info.fullHeight);
+      const previousHeight = this.currentBlockInfo?.fullHeight;
       this.currentBlockInfo = info;
+      
+      // Trigger callbacks if this is a new block
+      if (!previousHeight || info.fullHeight > previousHeight) {
+        console.log(`New block detected: ${previousHeight || 'unknown'} -> ${info.fullHeight}`);
+        this.blockNotificationCallbacks.forEach(callback => {
+          try {
+            callback(info);
+          } catch (error) {
+            console.error('Error in block notification callback:', error);
+          }
+        });
+      }
     });
 
     this.socket.on('disconnect', () => {
@@ -65,6 +79,17 @@ export class ErgoNodeService {
 
   getCurrentBlockInfo(): NodeInfo | null {
     return this.currentBlockInfo;
+  }
+
+  onBlockNotification(callback: (blockInfo: NodeInfo) => void): void {
+    this.blockNotificationCallbacks.push(callback);
+  }
+
+  removeBlockNotificationCallback(callback: (blockInfo: NodeInfo) => void): void {
+    const index = this.blockNotificationCallbacks.indexOf(callback);
+    if (index > -1) {
+      this.blockNotificationCallbacks.splice(index, 1);
+    }
   }
 
   cleanup(): void {
@@ -110,6 +135,10 @@ export class ErgoNodeService {
 
   // Get current blockchain height
   async getCurrentHeight(): Promise<number> {
+    if (this.currentBlockInfo) {
+      return this.currentBlockInfo.fullHeight;
+    }
+
     try {
       const response = await this.client.get('/info');
       return response.data.fullHeight || 0;

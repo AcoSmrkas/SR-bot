@@ -16,6 +16,8 @@ export class StorageRentBot {
   private lastSearchOffset: number = 0;
   private startTime: Date;
   private logger: any; // Will be injected
+  private blockNotificationCallback: ((blockInfo: any) => void) | null = null;
+  private isProcessing: boolean = false;
 
   constructor(
     config: Config,
@@ -90,9 +92,12 @@ export class StorageRentBot {
       // Run initial scan
       await this.runScanAndProcess();
 
-      // Set up cron job if enabled
+      // Set up processing method based on configuration
       if (this.config.enableCron) {
         this.setupCronJob();
+      } else {
+        // Use socket-based processing by default
+        this.setupBlockNotifications();
       }
 
       this.logger.info('Storage Rent Bot started successfully', { component: 'bot' });
@@ -117,6 +122,11 @@ export class StorageRentBot {
     if (this.cronJob) {
       this.cronJob.stop();
       this.cronJob = null;
+    }
+
+    if (this.blockNotificationCallback) {
+      this.ergoNode.removeBlockNotificationCallback(this.blockNotificationCallback);
+      this.blockNotificationCallback = null;
     }
 
     await this.database.setBotState('status', 'stopped');
@@ -154,8 +164,159 @@ export class StorageRentBot {
     });
   }
 
+  // Set up socket-based block notification processing  
+  private setupBlockNotifications(): void {
+    this.blockNotificationCallback = async (blockInfo: any) => {
+      if (!this.isRunning) return;
+      
+      this.logger.info('🚨 NEW BLOCK NOTIFICATION - Processing eligible transactions immediately', { 
+        component: 'socket', 
+        height: blockInfo.fullHeight,
+        priority: 'HIGH'
+      });
+      
+      try {
+        // ALWAYS process eligible boxes from queue first (fast)
+        await this.processEligibleBoxesFromQueue();
+        
+        // Only do full scan if not already processing and needed
+        if (!this.isProcessing) {
+          const currentHeight = await this.ergoNode.getCurrentHeight();
+          const shouldScanQueue = currentHeight - this.lastQueueScanHeight >= 50;
+          
+          if (shouldScanQueue) {
+            this.logger.info('📊 Queue scan needed - running full scan after eligible processing', { 
+              component: 'socket',
+              currentHeight,
+              lastQueueScanHeight: this.lastQueueScanHeight
+            });
+            await this.runScanAndProcess();
+          }
+        } else {
+          this.logger.info('⏸️ Full scan already in progress - skipping to avoid conflicts', { 
+            component: 'socket'
+          });
+        }
+        
+      } catch (error) {
+        this.logger.error('❌ CRITICAL: Block notification processing failed', { 
+          component: 'socket', 
+          height: blockInfo.fullHeight,
+          error: error as Error,
+          priority: 'CRITICAL'
+        });
+      }
+    };
+
+    this.ergoNode.onBlockNotification(this.blockNotificationCallback);
+    this.logger.info('✅ Socket-based block notifications enabled - will process eligible TXs on every new block', { component: 'bot' });
+  }
+
+  // Process only eligible boxes from existing queue (fast, for new block notifications)
+  async processEligibleBoxesFromQueue(): Promise<ProcessingResult> {
+    const startTime = Date.now();
+    
+    try {
+      const currentHeight = await this.ergoNode.getCurrentHeight();
+      
+      this.logger.info('🚀 FAST CHECK: Processing eligible boxes from queue', { 
+        component: 'processor', 
+        currentHeight,
+        priority: 'HIGH'
+      });
+      
+      const minAge = this.config.minStorageRentAgeBlocks;
+      const cutoffHeight = currentHeight - minAge;
+      
+      // Find all boxes from heights that are now eligible
+      const nowEligible: EligibleBox[] = [];
+      const heightsToRemove: number[] = [];
+      
+      for (const [height, boxes] of this.queuedBoxesByHeight) {
+        const eligibleAtHeight = height + minAge;
+        const isEligible = currentHeight >= eligibleAtHeight;
+        
+        if (isEligible) {
+          nowEligible.push(...boxes);
+          heightsToRemove.push(height);
+          this.logger.info(`📦 Found ${boxes.length} eligible boxes from height ${height}`, { 
+            component: 'processor',
+            height,
+            eligibleAtHeight,
+            currentHeight
+          });
+        }
+      }
+      
+      // Remove processed height groups from queue
+      for (const height of heightsToRemove) {
+        this.queuedBoxesByHeight.delete(height);
+      }
+      
+      if (nowEligible.length === 0) {
+        this.logger.info('⏳ No boxes eligible yet in current queue', { 
+          component: 'processor',
+          queuedHeights: this.queuedBoxesByHeight.size
+        });
+        return {
+          processedBoxes: 0,
+          successfulTransactions: 0,
+          failedTransactions: 0,
+          totalRentCollected: 0n,
+          totalFeesPaid: 0n,
+          errors: []
+        };
+      }
+      
+      this.logger.info(`💰 PROCESSING ${nowEligible.length} eligible boxes immediately!`, { 
+        component: 'processor',
+        eligibleCount: nowEligible.length,
+        priority: 'CRITICAL'
+      });
+      
+      // Update wallet balance and process eligible boxes
+      await this.updateWalletBalance();
+      const processingResult = await this.processEligibleBoxes(nowEligible);
+      await this.updateMetrics();
+
+      const duration = Date.now() - startTime;
+      this.logger.info('✅ Fast eligible processing completed', {
+        component: 'processor',
+        duration,
+        processed: processingResult.processedBoxes,
+        successful: processingResult.successfulTransactions,
+        failed: processingResult.failedTransactions
+      });
+
+      return processingResult;
+
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      this.logger.error('❌ Fast eligible processing failed', {
+        component: 'processor',
+        duration,
+        error: error as Error
+      });
+      throw error;
+    }
+  }
+
   // Main scan and process cycle
   async runScanAndProcess(): Promise<ProcessingResult> {
+    // Prevent concurrent scans
+    if (this.isProcessing) {
+      this.logger.warn('⚠️ Scan already in progress - skipping duplicate request', { component: 'bot' });
+      return {
+        processedBoxes: 0,
+        successfulTransactions: 0,
+        failedTransactions: 0,
+        totalRentCollected: 0n,
+        totalFeesPaid: 0n,
+        errors: ['Scan already in progress']
+      };
+    }
+
+    this.isProcessing = true;
     const startTime = Date.now();
     
     try {
@@ -332,6 +493,8 @@ export class StorageRentBot {
         error: error as Error
       });
       throw error;
+    } finally {
+      this.isProcessing = false;
     }
   }
 

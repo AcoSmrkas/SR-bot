@@ -74,7 +74,7 @@ export function loadConfig(): Config {
 
     // Bot Behavior
     dryRun: getEnvBoolean('DRY_RUN', process.env.NODE_ENV === 'dry-run'),
-    enableCron: getEnvBoolean('ENABLE_CRON', true),
+    enableCron: getEnvBoolean('ENABLE_CRON', false),
     cronSchedule: getEnvVar('CRON_SCHEDULE', '*/2 * * * * *'), // Every 2 seconds for competitive claiming
 
     // Monitoring
