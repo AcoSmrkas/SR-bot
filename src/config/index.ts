@@ -39,14 +39,6 @@ function getEnvBoolean(name: string, defaultValue: boolean): boolean {
 }
 
 export function loadConfig(): Config {
-  // Check for required environment variables
-  const requiredVars = ['WALLET_MNEMONIC', 'WALLET_PASSWORD'];
-  for (const varName of requiredVars) {
-    if (!process.env[varName] || process.env[varName] === `your_${varName.toLowerCase()}_here`) {
-      throw new Error(`${varName} must be set in environment variables`);
-    }
-  }
-
   const config: Config = {
     // Ergo Node Configuration
     ergoNodeUrl: getEnvVar('ERGO_NODE_URL', 'http://213.239.193.208:9053'),
@@ -146,12 +138,6 @@ function validateConfig(config: Config): void {
 
   if (config.metricsPort < 1024 || config.metricsPort > 65535) {
     throw new Error('METRICS_PORT must be between 1024 and 65535');
-  }
-
-  // Validate wallet mnemonic format (basic check)
-  const mnemonicWords = config.walletMnemonic.trim().split(/\s+/);
-  if (mnemonicWords.length !== 12 && mnemonicWords.length !== 15 && mnemonicWords.length !== 24) {
-    throw new Error('WALLET_MNEMONIC must be 12, 15, or 24 words');
   }
 
   // Validate URLs

@@ -1,10 +1,14 @@
 import axios, { AxiosInstance } from 'axios';
 import { estimateBoxSize } from '@fleet-sdk/serializer';
+import { io, Socket } from 'socket.io-client';
 import { Config, NodeInfo, BoxData, EligibleBox } from '../types';
 
 export class ErgoNodeService {
   private client: AxiosInstance;
+  private explorerClient: AxiosInstance;
   private config: Config;
+  private socket: Socket | null = null;
+  private currentBlockInfo: NodeInfo | null = null;
 
   constructor(config: Config) {
     this.config = config;
@@ -23,6 +27,75 @@ export class ErgoNodeService {
       timeout: 10000,
       headers,
     });
+
+    // Explorer client for box fetching
+    this.explorerClient = axios.create({
+      baseURL: config.ergoExplorerUrl,
+      timeout: 30000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    this.initSocket();
+  }
+
+  private initSocket(): void {
+    const SOCKET_URL = 'https://socket.ergexplorer.com';
+    
+    this.socket = io(SOCKET_URL);
+
+    this.socket.on('connect', () => {
+      console.log('Connected to ErgoExplorer socket at', SOCKET_URL);
+    });
+
+    this.socket.on('connect_error', (error) => {
+      console.error('Socket connection error:', error);
+    });
+
+    this.socket.on('info', (info: NodeInfo) => {
+      console.log('Received block info update:', info.fullHeight);
+      this.currentBlockInfo = info;
+    });
+
+    this.socket.on('disconnect', () => {
+      console.log('Disconnected from socket');
+    });
+  }
+
+  getCurrentBlockInfo(): NodeInfo | null {
+    return this.currentBlockInfo;
+  }
+
+  cleanup(): void {
+    if (this.socket) {
+      this.socket.disconnect();
+      this.socket = null;
+    }
+  }
+
+  // Helper method to retry API calls
+  private async retryApiCall<T>(
+    apiCall: () => Promise<T>,
+    maxRetries: number = 3,
+    delayMs: number = 1000
+  ): Promise<T> {
+    let lastError: any;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await apiCall();
+      } catch (error) {
+        lastError = error;
+        console.warn(`API call failed (attempt ${attempt}/${maxRetries}):`, error instanceof Error ? error.message : String(error));
+        
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, delayMs * attempt));
+        }
+      }
+    }
+    
+    throw lastError;
   }
 
   // Health check
@@ -190,22 +263,43 @@ export class ErgoNodeService {
       
       // INFINITE SEARCH: Continue searching until we find enough boxes
       // Start from a reasonable offset to find boxes around height 495533
-      const batchSize = 1000; // Smaller batch for testing
+      const batchSize = 1; // Smaller batch for testing
       let boxesChecked = 0;
-      let offset = startOffset === 0 ? 44160000 : startOffset; // Start from 10M offset to find recent boxes that will become eligible soon
+      let offset = startOffset === 0 ? currentHeight - minAge : startOffset; // Start from 10M offset to find recent boxes that will become eligible soon
       
       while (totalBoxesFound < targetBoxCount) {
         try {
           console.log(`Searching box range offset=${offset}, limit=${batchSize}`);
           
-          // Get box IDs from this range
-          const response = await this.client.get('/blockchain/box/range', {
-            params: { offset: offset, limit: batchSize }
-          });
-          
-          response.data = response.data.reverse();
+          // Get box IDs from this range with retry
+          const blocksResponse = await this.retryApiCall(() => 
+            this.explorerClient.get('/api/v1/blocks', {
+              params: {
+                limit: 20,
+                offset: offset - 1,
+                sortBy: 'height',
+                sortDirection: 'asc'
+              }
+            })
+          );
 
-          const boxIds = response.data;
+          const blockInfo = blocksResponse.data.items[0];
+          const blockResponse = await this.retryApiCall(() => 
+            this.explorerClient.get(`/api/v1/blocks/${blockInfo.id}`)
+          );
+          
+          let boxIds = [];
+          if (blockResponse.data && blockResponse.data.block && blockResponse.data.block.blockTransactions) {
+            // Extract boxes from all transaction outputs in the block
+            for (const tx of blockResponse.data.block.blockTransactions) {
+              if (tx.outputs) {
+                for (const output of tx.outputs) {
+                  boxIds.push(output.id);
+                }
+              }
+            }
+          }
+
           console.log(`Found ${boxIds.length} box IDs in range`);
           
           // If no more boxes, we've reached the end
@@ -217,7 +311,11 @@ export class ErgoNodeService {
           // Check each box for eligibility
           for (const boxId of boxIds) {
             try {
-              const boxResponse = await this.client.get(`/blockchain/box/byId/${boxId}`);
+              // Add small delay between API calls
+              await new Promise(resolve => setTimeout(resolve, 100));
+              const boxResponse = await this.retryApiCall(() => 
+                this.explorerClient.get(`/api/v1/boxes/${boxId}`)
+              );
               const box = boxResponse.data;
               boxesChecked++;
               
@@ -245,6 +343,10 @@ export class ErgoNodeService {
               
               // Skip if too far in future (>1000 blocks)
               if (blocksUntilEligible > 1000) {
+                continue;
+              }
+
+              if (box.spentTransactionId !== null) {
                 continue;
               }
               
@@ -307,12 +409,12 @@ export class ErgoNodeService {
           }
           
           // Move to next batch
-          offset -= batchSize;
+          offset += batchSize;
           nextOffset = offset;
           
         } catch (error) {
           console.warn(`Error searching range ${offset}-${offset + batchSize}:`, error);
-          offset -= batchSize;
+          offset += batchSize;
           nextOffset = offset;
         }
       }
