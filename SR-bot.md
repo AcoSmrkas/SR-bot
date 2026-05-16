@@ -10,7 +10,7 @@ The SR-bot is an automated tool designed to claim storage rent fees on the Ergo 
 
 1. **Box Scanner** - Identifies eligible boxes for storage rent collection
 2. **Transaction Builder** - Uses Fleet SDK to construct storage rent claiming transactions
-3. **Transaction Signer** - Uses Ergo AppKit to sign transactions with wallet secrets
+3. **Storage-Rent Proof Builder** - Uses empty proofs and context extension #127 for expired boxes
 4. **Fee Calculator** - Calculates appropriate storage rent fees based on box size
 5. **Bot Runner** - Main orchestration logic with error handling and logging
 
@@ -76,8 +76,12 @@ totalFee = rentFee + transactionFee
 
 ### Environment Variables (.env)
 - `ERGO_NODE_URL` - Ergo node API endpoint
-- `WALLET_MNEMONIC` - Wallet mnemonic phrase for signing
-- `WALLET_PASSWORD` - Wallet password
+- `ADDITIONAL_SUBMIT_NODE_URLS` - Extra REST submit nodes
+- `ENABLE_NODE_DISCOVERY` - Discover candidate REST submit nodes from ergonodes hosts
+- `ENABLE_SUBMIT_BROADCAST` - Fan out submitted transactions to active REST nodes
+- `CONFIRM_PRIMARY_BEFORE_BROADCAST` - Wait for primary confirmation before broadcast
+- `WALLET_MNEMONIC` - Optional wallet mnemonic phrase for address/status only
+- `WALLET_PASSWORD` - Optional wallet password
 - `NETWORK_TYPE` - 'mainnet' or 'testnet'
 - `MIN_RENT_THRESHOLD` - Minimum rent fee to collect (in nanoergs)
 - `MAX_BOXES_PER_TX` - Maximum boxes to include in single transaction
@@ -92,8 +96,8 @@ totalFee = rentFee + transactionFee
 3. Group boxes into batches for efficient transaction processing
 4. Build transaction using Fleet SDK with proper inputs/outputs
 5. Calculate and include appropriate fees
-6. Sign transaction using Ergo AppKit
-7. Submit to network and monitor confirmation
+6. Submit empty-proof storage-rent transaction to the configured node
+7. Monitor confirmation
 
 ### Error Handling
 - Network connectivity issues
@@ -137,4 +141,4 @@ totalFee = rentFee + transactionFee
 - Multi-wallet support for increased throughput
 - Advanced box selection algorithms
 - Integration with mining pools for rent sharing
-- Automated profit optimization strategies 
+- Automated profit optimization strategies

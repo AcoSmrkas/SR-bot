@@ -3,18 +3,37 @@ import { Box } from '@fleet-sdk/core';
 export interface Config {
   // Ergo Node Configuration
   ergoNodeUrl: string;
+  txSubmitNodeUrl: string;
   ergoNodeApiKey?: string;
   ergoExplorerUrl: string;
   networkType: 'mainnet' | 'testnet';
+  additionalSubmitNodeUrls: string[];
+  enableNodeDiscovery: boolean;
+  nodeDiscoveryUrl: string;
+  nodeDiscoveryRestPort: number;
+  nodeDiscoveryCacheMs: number;
+  nodeBlacklistMs: number;
+  nodeProbeTimeout: number;
+  nodeProbeConcurrency: number;
+  enableSubmitBroadcast: boolean;
+  confirmPrimaryBeforeBroadcast: boolean;
 
   // Wallet Configuration
-  walletMnemonic: string;
-  walletPassword: string;
+  walletMnemonic?: string;
+  walletPassword?: string;
 
   // Bot Configuration
   minRentThreshold: number;
   maxBoxesPerTx: number;
   scanInterval: number;
+  scanBoxRangeBatchSize: number;
+  scanMaxRangesPerCycle: number;
+  scanRequestTimeout: number;
+  scanBoxDetailConcurrency: number;
+  scanIndexLookback: number;
+  scanIndexLookahead: number;
+  scanRecentIndexLookback: number;
+  scanFutureBlockWindow: number;
   rentFeePerByte: number;
   minBoxValuePerByte: number;
 
@@ -32,6 +51,8 @@ export interface Config {
   // Transaction Configuration
   transactionFee: number;
   maxTransactionSize: number;
+  storageRentMode: 'miner' | 'address';
+  storageRentCollectAddress?: string;
 
   // Bot Behavior
   dryRun: boolean;
@@ -41,6 +62,64 @@ export interface Config {
   // Monitoring
   enableMetrics: boolean;
   metricsPort: number;
+  enableUi: boolean;
+  uiHost: string;
+  uiPort: number;
+  uiRefreshMs: number;
+}
+
+export interface StorageRentParameters {
+  storageFeeFactor: number;
+  minValuePerByte: number;
+  storagePeriodBlocks: number;
+}
+
+export interface SubmitNode {
+  url: string;
+  network: string;
+  fullHeight: number;
+  responseTimeMs?: number;
+  isMining?: boolean;
+  name?: string;
+  appVersion?: string;
+}
+
+export interface SubmitNodeCandidate {
+  url: string;
+  source?: string;
+  name?: string;
+  appVersion?: string;
+}
+
+export interface SubmitNodeRecord {
+  url: string;
+  source: string;
+  active: boolean;
+  discoveredAt: Date;
+  lastSeenAt: Date;
+  lastSuccessAt?: Date;
+  lastFailedAt?: Date;
+  failureCount: number;
+  network?: string;
+  fullHeight?: number;
+  responseTimeMs?: number;
+  isMining?: boolean;
+  name?: string;
+  appVersion?: string;
+  error?: string;
+}
+
+export interface NodeSubmitResult {
+  url: string;
+  txId?: string;
+  accepted: boolean;
+  error?: string;
+}
+
+export interface BroadcastResult {
+  attempted: number;
+  accepted: NodeSubmitResult[];
+  rejected: NodeSubmitResult[];
 }
 
 export interface EligibleBox {
@@ -126,7 +205,8 @@ export interface BoxData {
   index: number;
   globalIndex: number;
   creationHeight: number;
-  settlementHeight: number;
+  inclusionHeight?: number;
+  settlementHeight?: number | null;
   ergoTree: string;
   address: string;
   assets: Array<{
@@ -221,4 +301,4 @@ export interface LogContext {
   height?: number;
   duration?: number;
   error?: Error;
-} 
+}

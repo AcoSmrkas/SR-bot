@@ -33,8 +33,13 @@ console.log('Importing StorageRentBot...');
 import { StorageRentBot } from './services/storageRentBot';
 console.log('StorageRentBot imported successfully');
 
+console.log('Importing UIServer...');
+import { UIServer } from './services/uiServer';
+console.log('UIServer imported successfully');
+
 // Global instances
 let bot: StorageRentBot | null = null;
+let uiServer: UIServer | null = null;
 let logger: any = null;
 
 // Graceful shutdown handler
@@ -46,6 +51,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }
 
   try {
+    if (uiServer) {
+      await uiServer.stop();
+      uiServer = null;
+    }
+
     if (bot) {
       await bot.cleanup();
     }
@@ -160,8 +170,12 @@ async function main(): Promise<void> {
     console.log('Configuration loaded successfully');
     console.log('Config:', { 
       ergoNodeUrl: config.ergoNodeUrl,
+      txSubmitNodeUrl: config.txSubmitNodeUrl,
       networkType: config.networkType,
-      dryRun: config.dryRun 
+      dryRun: config.dryRun,
+      enableUi: config.enableUi,
+      storageRentMode: config.storageRentMode,
+      storageRentCollectAddress: config.storageRentCollectAddress
     });
     
     // Initialize logger
@@ -182,9 +196,12 @@ async function main(): Promise<void> {
 
     console.log('Initializing Ergo node service...');
     // Initialize Ergo node service
-    const ergoNode = new ErgoNodeService(config);
+    const ergoNode = new ErgoNodeService(config, database);
     console.log('Ergo node service initialized');
     logger.info('Ergo node service initialized', { component: 'main' });
+    await ergoNode.initializeNodeDiscovery()
+      .then(() => logger.info('Submit node discovery refreshed', { component: 'main' }))
+      .catch((error) => logger.warn('Submit node discovery refresh failed', { component: 'main', error }));
 
     console.log('Initializing transaction service...');
     // Initialize transaction service
@@ -202,6 +219,13 @@ async function main(): Promise<void> {
     console.log('Bot initialization complete, starting bot...');
     await bot.start();
     console.log('Bot started successfully');
+
+    if (config.enableUi) {
+      console.log('Starting UI dashboard...');
+      uiServer = new UIServer(config, database, ergoNode, logger);
+      await uiServer.start();
+      console.log(`UI dashboard listening at http://${config.uiHost}:${config.uiPort}`);
+    }
 
     // Keep the process running
     console.log('SR-bot is running. Press Ctrl+C to stop.');
@@ -233,4 +257,4 @@ if (require.main === module) {
   });
 }
 
-export { StorageRentBot }; 
+export { StorageRentBot };

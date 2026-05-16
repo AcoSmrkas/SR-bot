@@ -35,13 +35,13 @@ check_node() {
         print_error "Node.js is not installed. Please install Node.js 18+ to continue."
         exit 1
     fi
-    
+
     NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
     if [ "$NODE_VERSION" -lt 18 ]; then
         print_error "Node.js version 18+ is required. Current version: $(node -v)"
         exit 1
     fi
-    
+
     print_success "Node.js version: $(node -v)"
 }
 
@@ -65,14 +65,14 @@ create_directories() {
 # Check if .env file exists
 check_env() {
     if [ ! -f .env ]; then
-        print_warning ".env file not found. Creating from .env.example..."
-        if [ -f .env.example ]; then
-            cp .env.example .env
+        print_warning ".env file not found. Creating from env.example..."
+        if [ -f env.example ]; then
+            cp env.example .env
             print_warning "Please edit .env file with your configuration before running the bot"
-            print_warning "Required: WALLET_MNEMONIC, WALLET_PASSWORD, ERGO_NODE_URL"
+            print_warning "Required: ERGO_NODE_URL. Wallet mnemonic/password are optional for fee-only storage rent."
             exit 1
         else
-            print_error ".env.example file not found. Cannot create .env file."
+            print_error "env.example file not found. Cannot create .env file."
             exit 1
         fi
     fi
@@ -100,15 +100,15 @@ preflight_checks() {
     check_npm
     create_directories
     check_env
-    
+
     if [ ! -d "node_modules" ]; then
         install_deps
     fi
-    
+
     if [ ! -d "dist" ]; then
         build_project
     fi
-    
+
     print_success "Pre-flight checks completed"
 }
 
@@ -172,4 +172,4 @@ case "${1:-help}" in
     "help"|*)
         show_help
         ;;
-esac 
+esac

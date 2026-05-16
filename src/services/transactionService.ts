@@ -1,5 +1,6 @@
-import { EligibleBox, Config } from '../types';
-import { TransactionBuilder, OutputBuilder, ErgoAddress, RECOMMENDED_MIN_FEE_VALUE, ErgoUnsignedInput } from '@fleet-sdk/core';
+import { EligibleBox, Config, StorageRentParameters } from '../types';
+import { TransactionBuilder, OutputBuilder, ErgoAddress, ErgoUnsignedInput, SShort } from '@fleet-sdk/core';
+import { estimateBoxSize } from '@fleet-sdk/serializer';
 import * as ergo from 'ergo-lib-wasm-nodejs';
 import axios from 'axios';
 import jsonBigInt from 'json-bigint';
@@ -16,7 +17,16 @@ export class TransactionService {
 
   // Initialize wallet address from mnemonic
   private initializeWalletAddress(): void {
-    this.walletAddress = getAddressFromMnemonic(this.config.walletMnemonic, this.config.walletPassword);
+    if (!this.config.walletMnemonic || !this.config.walletPassword) {
+      this.walletAddress = '';
+      return;
+    }
+
+    this.walletAddress = getAddressFromMnemonic(
+      this.config.walletMnemonic,
+      this.config.walletPassword,
+      this.config.networkType
+    );
   }
 
   // Get wallet address
@@ -24,15 +34,31 @@ export class TransactionService {
     return this.walletAddress;
   }
 
+  private getStorageRentCollectAddress(): ErgoAddress | null {
+    if (this.config.storageRentMode !== 'address') {
+      return null;
+    }
+
+    if (!this.config.storageRentCollectAddress) {
+      throw new Error('STORAGE_RENT_COLLECT_ADDRESS is required when STORAGE_RENT_MODE=address');
+    }
+
+    try {
+      return ErgoAddress.fromBase58(this.config.storageRentCollectAddress);
+    } catch {
+      throw new Error('STORAGE_RENT_COLLECT_ADDRESS must be a valid Ergo address');
+    }
+  }
+
   // Create transaction batches
   createTransactionBatches(boxes: EligibleBox[]): EligibleBox[][] {
     const batches: EligibleBox[][] = [];
     const batchSize = this.config.maxBoxesPerTx;
-    
+
     for (let i = 0; i < boxes.length; i += batchSize) {
       batches.push(boxes.slice(i, i + batchSize));
     }
-    
+
     return batches;
   }
 
@@ -41,127 +67,225 @@ export class TransactionService {
     boxes: EligibleBox[],
     changeAddress: string,
     currentHeight: number,
-    ergoNode?: any
+    ergoNode: any,
+    rentParams: StorageRentParameters
   ): Promise<{
     unsignedTx: any;
     inputBoxes: any[];
     totalRentCollected: bigint;
+    minerFee: bigint;
+    collectorValue: bigint;
+    collectorTokenCount: number;
   }> {
-    let totalRentCollected = 0n;
-    
-    // Calculate total rent to collect
-    for (const box of boxes) {
-      totalRentCollected += box.rentFee;
-    }
+    const spendHeight = currentHeight + 1;
+    const fleetInputs: ErgoUnsignedInput[] = [];
+    const outputs: OutputBuilder[] = [];
+    const burnedTokenAmounts = new Map<string, bigint>();
+    const collectedTokenAmounts = new Map<string, bigint>();
+    const collectAddress = this.getStorageRentCollectAddress();
+    let collectedInputValue = 0n;
+    const plans: Array<{
+      input: ErgoUnsignedInput;
+      boxId: string;
+      mode: 'recreate' | 'consume' | 'collect';
+      outputIndex?: number;
+      feeContribution: bigint;
+      inputValue: bigint;
+      outputValue: bigint;
+      storageFee: bigint;
+    }> = [];
+    const addBurnedToken = (tokenId: string, amount: bigint): void => {
+      burnedTokenAmounts.set(tokenId, (burnedTokenAmounts.get(tokenId) || 0n) + amount);
+    };
+    const addCollectedToken = (tokenId: string, amount: bigint): void => {
+      collectedTokenAmounts.set(tokenId, (collectedTokenAmounts.get(tokenId) || 0n) + amount);
+    };
 
-    // Create Fleet SDK inputs with context extensions for storage rent
-    const fleetInputs = [];
-    for (let i = 0; i < boxes.length; i++) {
-      const box = boxes[i]!; // Non-null assertion since we're iterating through boxes array
-      console.log(`Creating Fleet SDK input for box: ${box.boxId}`);
-      
+    for (const box of boxes) {
       try {
         const nodeBoxData = await ergoNode.getBoxById(box.boxId);
         if (!nodeBoxData) {
           throw new Error(`Box ${box.boxId} not found or already spent`);
         }
-        
-        // Create Fleet SDK input
+
+        const inputValue = BigInt(nodeBoxData.value);
+        const boxSize = estimateBoxSize(nodeBoxData);
+        const storageFee = BigInt(boxSize) * BigInt(rentParams.storageFeeFactor);
         const fleetInput = new ErgoUnsignedInput(nodeBoxData);
-        
-        // Set context extension: variable 0x7f (127 decimal) = output index (hex encoded)
-        // Use their pattern: even indices only (input_index * 2)
-        const outputIndex = (i * 2).toString(16).padStart(2, '0'); // Convert to 2-digit hex
-        fleetInput.setContextExtension({ 0x7f: `03${outputIndex}` }); // Storage rent key 0x7f + 03 prefix + hex index
-        
-        console.log(`Set context extension for input ${i}: { 0x7f: "03${outputIndex}" }`);
+        const inputAssets = nodeBoxData.assets || [];
+
+        if (inputValue <= storageFee) {
+          fleetInputs.push(fleetInput);
+          const shouldCollectAssets = collectAddress !== null && inputAssets.length > 0;
+
+          if (shouldCollectAssets) {
+            collectedInputValue += inputValue;
+            for (const asset of inputAssets) {
+              addCollectedToken(asset.tokenId, BigInt(asset.amount));
+            }
+          } else {
+            for (const asset of inputAssets) {
+              addBurnedToken(asset.tokenId, BigInt(asset.amount));
+            }
+          }
+
+          plans.push({
+            input: fleetInput,
+            boxId: box.boxId,
+            mode: shouldCollectAssets ? 'collect' : 'consume',
+            feeContribution: shouldCollectAssets ? 0n : inputValue,
+            inputValue,
+            outputValue: 0n,
+            storageFee
+          });
+          continue;
+        }
+
+        const targetAddress = ErgoAddress.fromErgoTree(nodeBoxData.ergoTree);
+        let outputValue = inputValue - storageFee;
+        const output = new OutputBuilder(outputValue.toString(), targetAddress)
+          .addTokens(inputAssets.map((asset: any) => ({
+            tokenId: asset.tokenId,
+            amount: BigInt(asset.amount)
+          })))
+          .setAdditionalRegisters(nodeBoxData.additionalRegisters || {})
+          .setCreationHeight(spendHeight);
+
+        const minOutputValue = BigInt(output.estimateSize()) * BigInt(rentParams.minValuePerByte);
+        if (outputValue < minOutputValue) {
+          outputValue = minOutputValue;
+          output.setValue(outputValue.toString());
+        }
+
+        const feeContribution = inputValue - outputValue;
+        if (feeContribution <= 0n) {
+          throw new Error(`Box ${box.boxId} cannot pay positive storage rent after min-box-value reserve`);
+        }
+
+        const outputIndex = outputs.length;
         fleetInputs.push(fleetInput);
+        outputs.push(output);
+        plans.push({
+          input: fleetInput,
+          boxId: box.boxId,
+          mode: 'recreate',
+          outputIndex,
+          feeContribution,
+          inputValue,
+          outputValue,
+          storageFee
+        });
       } catch (error) {
-        throw new Error(`Failed to create Fleet SDK input for ${box.boxId}: ${error}`);
+        throw new Error(`Failed to plan storage rent input ${box.boxId}: ${error}`);
       }
     }
-    
-    // Create outputs for each box (preserving content but collecting rent)
-    const outputs = boxes.map(box => {
-      const newValue = box.value - box.rentFee; // Deduct rent fee
-      const targetAddress = ErgoAddress.fromErgoTree(box.ergoTree);
-      
-      return new OutputBuilder(
-        newValue.toString(),
-        targetAddress
-      )
-      .addTokens(box.assets.map(asset => ({
-        tokenId: asset.tokenId,
-        amount: asset.amount.toString()
-      })))
-      .setAdditionalRegisters(box.additionalRegisters)
-      .setCreationHeight(currentHeight + 1); // Set to current height + 1 for recreated boxes
-    });
 
-    // Calculate total input value
-    const totalInputValue = boxes.reduce((sum, box) => sum + box.value, 0n);
-    
-    // Calculate total output value (new boxes + rent collection minus fee)
-    const rentAfterFee = totalRentCollected - BigInt(RECOMMENDED_MIN_FEE_VALUE);
-    const totalOutputValue = boxes.reduce((sum, box) => sum + (box.value - box.rentFee), 0n) + rentAfterFee;
-    
-    // Calculate transaction fee
-    const transactionFee = BigInt(RECOMMENDED_MIN_FEE_VALUE);
-    
-    // LOG DETAILED BREAKDOWN
-    console.log('\n=== TRANSACTION CALCULATION ===');
-    console.log(`Total input value: ${totalInputValue} nanoErgs`);
-    console.log(`Total output value: ${totalOutputValue} nanoErgs`);
-    console.log(`  - New boxes total: ${boxes.reduce((sum, box) => sum + (box.value - box.rentFee), 0n)} nanoErgs`);
-    console.log(`  - Rent collected (after fee): ${rentAfterFee} nanoErgs (${totalRentCollected} - ${transactionFee})`);
-    console.log(`Transaction fee: ${transactionFee} nanoErgs`);
-    console.log(`Input - Output: ${totalInputValue - totalOutputValue} nanoErgs (should cover fee)`);
-    console.log(`Box count: ${boxes.length}`);
-    boxes.forEach((box, i) => {
-      console.log(`  Box ${i}: input=${box.value}, output=${box.value - box.rentFee}, rent=${box.rentFee}`);
-    });
-    console.log('===============================\n');
-    
-    // The math should be: inputs = outputs + fee
-    // So: totalInputValue = totalOutputValue + transactionFee
-    // Which means: totalInputValue - totalOutputValue should >= transactionFee
-    const availableForFee = totalInputValue - totalOutputValue;
-    console.log(`Available for fee: ${availableForFee} nanoErgs, needed: ${transactionFee} nanoErgs`);
-    
-    // For now, only use the storage rent boxes - wallet UTXO support can be added later
-    if (availableForFee < transactionFee) {
-      throw new Error(`Insufficient fee available from claimed boxes. Available: ${availableForFee}, Need: ${transactionFee}. Wallet UTXO support not implemented yet.`);
+    let collectorValue = 0n;
+    let collectorOutputIndex: number | undefined;
+
+    if (collectAddress && collectedInputValue > 0n && collectedTokenAmounts.size > 0) {
+      const collectedTokens = Array.from(collectedTokenAmounts.entries()).map(([tokenId, amount]) => ({
+        tokenId,
+        amount
+      }));
+      const collectorOutput = new OutputBuilder('1', collectAddress)
+        .addTokens(collectedTokens);
+      const minCollectorValue = BigInt(collectorOutput.estimateSize()) * BigInt(rentParams.minValuePerByte);
+
+      if (collectedInputValue > minCollectorValue) {
+        collectorValue = minCollectorValue;
+        collectorOutput.setValue(collectorValue.toString());
+        collectorOutputIndex = outputs.length;
+        outputs.push(collectorOutput);
+      } else {
+        for (const token of collectedTokens) {
+          addBurnedToken(token.tokenId, token.amount);
+        }
+
+        collectedTokenAmounts.clear();
+        for (const plan of plans) {
+          if (plan.mode === 'collect') {
+            plan.mode = 'consume';
+            plan.feeContribution = plan.inputValue;
+          }
+        }
+      }
     }
-    
-    // Send all collected rent directly to miners via fee (no rent collection for ourselves)
-    console.log(`Sending all collected rent (${totalRentCollected} nanoErgs) to miners via transaction fee`);
 
-    // Build storage rent transaction - all rent goes to miners, no rent collection output
-    const unsignedTx = new TransactionBuilder(currentHeight)
-      .from(fleetInputs) // Use Fleet SDK inputs with context extensions
-      .to(outputs) // Only recreated boxes, no rent collection
-      .payFee(totalRentCollected.toString()) // Pay ALL collected rent as fee to miners
+    const feeOutputIndex = outputs.length;
+    for (const plan of plans) {
+      const targetOutputIndex = plan.mode === 'recreate'
+        ? plan.outputIndex!
+        : plan.mode === 'collect' && collectorOutputIndex !== undefined
+          ? collectorOutputIndex
+          : feeOutputIndex;
+      plan.input.setContextExtension({ 127: SShort(targetOutputIndex) });
+    }
+
+    const totalInputValue = plans.reduce((sum, plan) => sum + plan.inputValue, 0n);
+    const totalRecreatedValue = plans.reduce((sum, plan) => sum + plan.outputValue, 0n);
+    const planFeeContribution = plans.reduce((sum, plan) => sum + plan.feeContribution, 0n);
+    const collectFeeContribution = collectorOutputIndex === undefined ? 0n : collectedInputValue - collectorValue;
+    const minerFee = planFeeContribution + collectFeeContribution;
+    const totalRentCollected = planFeeContribution + (collectorOutputIndex === undefined ? 0n : collectedInputValue);
+    const burnedTokens = Array.from(burnedTokenAmounts.entries()).map(([tokenId, amount]) => ({
+      tokenId,
+      amount
+    }));
+    const collectorTokenCount = collectedTokenAmounts.size;
+
+    if (minerFee <= 0n) {
+      throw new Error('No positive miner fee can be collected from this batch');
+    }
+
+    console.log('\n=== STORAGE RENT TRANSACTION PLAN ===');
+    console.log(`Mode: ${this.config.storageRentMode}`);
+    console.log(`Spend height: ${spendHeight}`);
+    console.log(`Total input value: ${totalInputValue} nanoErgs`);
+    console.log(`Recreated value: ${totalRecreatedValue} nanoErgs`);
+    console.log(`Collector value: ${collectorValue} nanoErgs`);
+    console.log(`Collector token entries: ${collectorTokenCount}`);
+    console.log(`Miner fee value: ${minerFee} nanoErgs`);
+    console.log(`Burned token entries: ${burnedTokens.length}`);
+    for (const plan of plans) {
+      console.log(`  ${plan.boxId}: ${plan.mode}, input=${plan.inputValue}, output=${plan.outputValue}, fee=${plan.feeContribution}, storageFee=${plan.storageFee}`);
+    }
+    console.log('=====================================\n');
+
+    let txBuilder = new TransactionBuilder(spendHeight)
+      .from(fleetInputs)
+      .payFee(minerFee.toString());
+
+    if (outputs.length > 0) {
+      txBuilder = txBuilder.to(outputs);
+    }
+
+    if (burnedTokens.length > 0) {
+      txBuilder = txBuilder
+        .burnTokens(burnedTokens)
+        .configure(settings => settings.allowTokenBurning());
+    }
+
+    const unsignedTx = txBuilder
       .build()
       .toEIP12Object();
 
     return {
       unsignedTx,
-      inputBoxes: fleetInputs, // Return Fleet SDK inputs
-      totalRentCollected
+      inputBoxes: fleetInputs,
+      totalRentCollected,
+      minerFee,
+      collectorValue,
+      collectorTokenCount
     };
   }
 
   // Sign and submit transaction using ergo-lib-wasm (fromUnsigned function)
   async fromUnsigned(unsignedTxJson: any): Promise<[string | null, any]> {
     try {
-      console.log('=== UNSIGNED TRANSACTION DETAILS ===');
-      console.log(JSON.stringify(unsignedTxJson, null, 4));
-      console.log('=====================================');
-
-      // For storage rent transactions, create signed transaction manually with empty proofs
-      const signedTx = this.createStorageRentSignedTx(unsignedTxJson);
+      const { signedTx } = this.createStorageRentSignedTx(unsignedTxJson);
       const txId = await this.sendTx(signedTx);
-      
+
       return [txId, signedTx];
     } catch (e) {
       console.error(e);
@@ -169,10 +293,12 @@ export class TransactionService {
     }
   }
 
-  // Create signed transaction for storage rent (no actual signing needed)
-  private createStorageRentSignedTx(unsignedTxJson: any): any {
-    console.log(unsignedTxJson);
+  createSignedStorageRentTransaction(unsignedTxJson: any): { txId: string; signedTx: string } {
+    return this.createStorageRentSignedTx(unsignedTxJson);
+  }
 
+  // Create signed transaction for storage rent (no actual signing needed)
+  private createStorageRentSignedTx(unsignedTxJson: any): { txId: string; signedTx: string } {
     const txId = ergo.UnsignedTransaction.from_json(jsonBigInt.stringify(unsignedTxJson)).id().to_str();
     // For storage rent claims, inputs have empty proofBytes but keep context extensions
     const signedInputs = unsignedTxJson.inputs.map((input: any) => ({
@@ -182,7 +308,7 @@ export class TransactionService {
         extension: input.extension || {} // Keep context extension
       }
     }));
-    
+
     const signedTxJson = {
       id: txId,
       inputs: signedInputs,
@@ -190,11 +316,12 @@ export class TransactionService {
       outputs: unsignedTxJson.outputs // Keep outputs exactly as-is
     };
 
-    console.log('=== STORAGE RENT SIGNED TRANSACTION ===');
-    console.log(JSON.stringify(signedTxJson, null, 4));
-    console.log('=======================================');
+    console.log(`Signed storage-rent transaction ${txId}: inputs=${signedInputs.length}, outputs=${signedTxJson.outputs.length}`);
 
-    return jsonBigInt.stringify(signedTxJson);
+    return {
+      txId,
+      signedTx: jsonBigInt.stringify(signedTxJson)
+    };
   }
 
 
@@ -203,20 +330,24 @@ export class TransactionService {
     const ctx = await this.getErgoStateContext();
     const wallet = this.createWallet();
     const inputDataBoxes = ergo.ErgoBoxes.from_boxes_json([]);
-    
+
     const signedTx = wallet.sign_transaction(ctx, unsignedTx, inputs, inputDataBoxes);
     return signedTx;
   }
 
   // Create wallet from mnemonic
   private createWallet(): any {
+    if (!this.config.walletMnemonic || !this.config.walletPassword) {
+      throw new Error('Wallet mnemonic/password are not configured');
+    }
+
     return createWallet(this.config.walletMnemonic, this.config.walletPassword);
   }
 
   // Send transaction to network
   private async sendTx(signedTx: any): Promise<string> {
-    const url = this.config.ergoNodeUrl + '/transactions';
-    
+    const url = this.config.txSubmitNodeUrl + '/transactions';
+
     const headers: any = {
       'Accept': 'application/json',
       'Content-Type': 'application/json'
@@ -248,10 +379,10 @@ export class TransactionService {
 
   // Get block headers from explorer
   private async getExplorerBlockHeaders(): Promise<any> {
-    const explorerUrl = this.config.networkType === 'testnet' 
-      ? 'https://api-testnet.ergoplatform.com' 
+    const explorerUrl = this.config.networkType === 'testnet'
+      ? 'https://api-testnet.ergoplatform.com'
       : 'https://api.ergoplatform.com';
-    
+
     const response = await axios.get(`${explorerUrl}/api/v1/blocks/headers`);
     return response.data;
   }
@@ -288,4 +419,4 @@ export class TransactionService {
   cleanup(): void {
     // Cleanup any resources if needed
   }
-} 
+}

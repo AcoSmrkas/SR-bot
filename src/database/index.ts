@@ -1,7 +1,20 @@
 import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs';
-import { EligibleBox, TransactionResult, BotState, BotMetrics } from '../types';
+import { EligibleBox, TransactionResult, BotState, BotMetrics, SubmitNode, SubmitNodeCandidate, SubmitNodeRecord } from '../types';
+
+function stringifyJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => (
+    typeof item === 'bigint' ? item.toString() : item
+  ));
+}
+
+function parseBoxAssets(value: string): EligibleBox['assets'] {
+  return JSON.parse(value).map((asset: any) => ({
+    tokenId: asset.tokenId,
+    amount: BigInt(asset.amount)
+  }));
+}
 
 export class Database {
   private db: sqlite3.Database;
@@ -57,12 +70,33 @@ export class Database {
         updated_at TEXT NOT NULL
       );
 
+      -- Table for persistent submit-node discovery/probe results
+      CREATE TABLE IF NOT EXISTS submit_nodes (
+        url TEXT PRIMARY KEY,
+        source TEXT NOT NULL DEFAULT 'configured',
+        active INTEGER NOT NULL DEFAULT 1,
+        discovered_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        last_success_at TEXT,
+        last_failed_at TEXT,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        network TEXT,
+        full_height INTEGER,
+        response_time_ms INTEGER,
+        is_mining INTEGER,
+        name TEXT,
+        app_version TEXT,
+        error TEXT
+      );
+
       -- Indexes for performance
       CREATE INDEX IF NOT EXISTS idx_eligible_boxes_status ON eligible_boxes(status);
       CREATE INDEX IF NOT EXISTS idx_eligible_boxes_discovered_at ON eligible_boxes(discovered_at);
       CREATE INDEX IF NOT EXISTS idx_eligible_boxes_creation_height ON eligible_boxes(creation_height);
       CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
       CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at);
+      CREATE INDEX IF NOT EXISTS idx_submit_nodes_active ON submit_nodes(active);
+      CREATE INDEX IF NOT EXISTS idx_submit_nodes_last_success_at ON submit_nodes(last_success_at);
     `;
 
     this.db.exec(createTablesSQL, (err) => {
@@ -94,8 +128,8 @@ export class Database {
         box.claimedAt?.toISOString() || null,
         box.txId || null,
         box.ergoTree,
-        JSON.stringify(box.assets),
-        JSON.stringify(box.additionalRegisters)
+        stringifyJson(box.assets),
+        stringifyJson(box.additionalRegisters)
       ];
 
       this.db.run(sql, params, function(err) {
@@ -136,7 +170,7 @@ export class Database {
             ...(row.claimed_at && { claimedAt: new Date(row.claimed_at) }),
             ...(row.tx_id && { txId: row.tx_id }),
             ergoTree: row.ergo_tree,
-            assets: JSON.parse(row.assets),
+            assets: parseBoxAssets(row.assets),
             additionalRegisters: JSON.parse(row.additional_registers)
           }));
           resolve(boxes);
@@ -186,7 +220,7 @@ export class Database {
             status: row.status,
             discoveredAt: new Date(row.discovered_at),
             ergoTree: row.ergo_tree,
-            assets: JSON.parse(row.assets),
+            assets: parseBoxAssets(row.assets),
             additionalRegisters: JSON.parse(row.additional_registers),
             ...(row.claimed_at && { claimedAt: new Date(row.claimed_at) }),
             ...(row.tx_id && { txId: row.tx_id })
@@ -320,6 +354,167 @@ export class Database {
     });
   }
 
+  async upsertSubmitNodeCandidates(
+    candidates: Array<string | SubmitNodeCandidate>,
+    source: string = 'ergonodes'
+  ): Promise<number> {
+    const uniqueCandidates = new Map<string, SubmitNodeCandidate>();
+    for (const item of candidates) {
+      const candidate = typeof item === 'string'
+        ? { url: item, source }
+        : { ...item, source: item.source ?? source };
+
+      if (!candidate.url) {
+        continue;
+      }
+
+      uniqueCandidates.set(candidate.url, {
+        ...uniqueCandidates.get(candidate.url),
+        ...candidate
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    for (const candidate of uniqueCandidates.values()) {
+      await new Promise<void>((resolve, reject) => {
+        const candidateSource = candidate.source ?? source;
+        const activeCandidate = candidateSource === 'configured' ? 1 : 0;
+        const sql = `
+          INSERT INTO submit_nodes (url, source, active, discovered_at, last_seen_at, name, app_version)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(url) DO UPDATE SET
+            source = excluded.source,
+            last_seen_at = excluded.last_seen_at,
+            name = COALESCE(excluded.name, submit_nodes.name),
+            app_version = COALESCE(excluded.app_version, submit_nodes.app_version)
+        `;
+
+        this.db.run(sql, [
+          candidate.url,
+          candidateSource,
+          activeCandidate,
+          now,
+          now,
+          candidate.name ?? null,
+          candidate.appVersion ?? null
+        ], function(err) {
+          if (err) {
+            reject(new Error(`Failed to upsert submit node candidate: ${err.message}`));
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
+
+    return uniqueCandidates.size;
+  }
+
+  async recordSubmitNodeProbeSuccess(node: SubmitNode): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const now = new Date().toISOString();
+      const sql = `
+        INSERT INTO submit_nodes (
+          url, source, active, discovered_at, last_seen_at, last_success_at,
+          failure_count, network, full_height, response_time_ms, is_mining, name, app_version, error
+        ) VALUES (?, 'probe', 1, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(url) DO UPDATE SET
+          active = 1,
+          last_seen_at = excluded.last_seen_at,
+          last_success_at = excluded.last_success_at,
+          network = excluded.network,
+          full_height = excluded.full_height,
+          response_time_ms = excluded.response_time_ms,
+          is_mining = excluded.is_mining,
+          name = COALESCE(excluded.name, submit_nodes.name),
+          app_version = COALESCE(excluded.app_version, submit_nodes.app_version),
+          error = NULL
+      `;
+
+      this.db.run(sql, [
+        node.url,
+        now,
+        now,
+        now,
+        node.network,
+        node.fullHeight,
+        node.responseTimeMs ?? null,
+        node.isMining === undefined ? null : Number(node.isMining),
+        node.name ?? null,
+        node.appVersion ?? null
+      ], function(err) {
+        if (err) {
+          reject(new Error(`Failed to record submit node probe success: ${err.message}`));
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  async recordSubmitNodeProbeFailure(url: string, error: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const now = new Date().toISOString();
+      const sql = `
+        INSERT INTO submit_nodes (
+          url, source, active, discovered_at, last_seen_at, last_failed_at, failure_count, error
+        ) VALUES (?, 'probe', 0, ?, ?, ?, 1, ?)
+        ON CONFLICT(url) DO UPDATE SET
+          active = 0,
+          last_seen_at = excluded.last_seen_at,
+          last_failed_at = excluded.last_failed_at,
+          failure_count = submit_nodes.failure_count + 1,
+          error = excluded.error
+      `;
+
+      this.db.run(sql, [url, now, now, now, error.slice(0, 500)], function(err) {
+        if (err) {
+          reject(new Error(`Failed to record submit node probe failure: ${err.message}`));
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  async getSubmitNodeRecords(activeOnly: boolean = true): Promise<SubmitNodeRecord[]> {
+    return new Promise((resolve, reject) => {
+      let sql = 'SELECT * FROM submit_nodes';
+      if (activeOnly) {
+        sql += ' WHERE active = 1';
+      }
+      sql += ' ORDER BY COALESCE(last_success_at, last_seen_at) DESC';
+
+      this.db.all(sql, [], (err, rows: any[]) => {
+        if (err) {
+          reject(new Error(`Failed to get submit nodes: ${err.message}`));
+          return;
+        }
+
+        const records: SubmitNodeRecord[] = rows.map(row => ({
+          url: row.url,
+          source: row.source,
+          active: row.active === 1,
+          discoveredAt: new Date(row.discovered_at),
+          lastSeenAt: new Date(row.last_seen_at),
+          failureCount: row.failure_count || 0,
+          ...(row.last_success_at && { lastSuccessAt: new Date(row.last_success_at) }),
+          ...(row.last_failed_at && { lastFailedAt: new Date(row.last_failed_at) }),
+          ...(row.network && { network: row.network }),
+          ...(row.full_height !== null && row.full_height !== undefined && { fullHeight: row.full_height }),
+          ...(row.response_time_ms !== null && row.response_time_ms !== undefined && { responseTimeMs: row.response_time_ms }),
+          ...(row.is_mining !== null && row.is_mining !== undefined && { isMining: row.is_mining === 1 }),
+          ...(row.name && { name: row.name }),
+          ...(row.app_version && { appVersion: row.app_version }),
+          ...(row.error && { error: row.error })
+        }));
+
+        resolve(records);
+      });
+    });
+  }
+
   // Metrics and statistics
   async getBotMetrics(): Promise<BotMetrics> {
     return new Promise((resolve, reject) => {
@@ -327,7 +522,6 @@ export class Database {
         SELECT 
           COUNT(*) as total_boxes_scanned,
           COUNT(CASE WHEN status != 'insufficient_funds' THEN 1 END) as eligible_boxes_found,
-          COALESCE(SUM(CASE WHEN status = 'claimed' THEN CAST(rent_fee AS INTEGER) ELSE 0 END), 0) as total_rent_collected,
           MAX(current_height) as last_scan_height,
           MAX(discovered_at) as last_scan_time
         FROM eligible_boxes
@@ -346,7 +540,7 @@ export class Database {
           const metrics: BotMetrics = {
             totalBoxesScanned: row.total_boxes_scanned || 0,
             eligibleBoxesFound: row.eligible_boxes_found || 0,
-            totalRentCollected: BigInt(row.total_rent_collected || 0),
+            totalRentCollected: transactionMetrics.totalRent,
             totalTransactionsFees: transactionMetrics.totalFees,
             successfulTransactions: transactionMetrics.successful,
             failedTransactions: transactionMetrics.failed,
@@ -364,11 +558,12 @@ export class Database {
     });
   }
 
-  private async getTransactionMetrics(): Promise<{ totalFees: bigint; successful: number; failed: number }> {
+  private async getTransactionMetrics(): Promise<{ totalRent: bigint; totalFees: bigint; successful: number; failed: number }> {
     return new Promise((resolve, reject) => {
       const sql = `
         SELECT 
-          COALESCE(SUM(CAST(transaction_fee AS INTEGER)), 0) as total_fees,
+          COALESCE(SUM(CASE WHEN status = 'confirmed' THEN CAST(total_rent_collected AS INTEGER) ELSE 0 END), 0) as total_rent,
+          COALESCE(SUM(CASE WHEN status = 'confirmed' THEN CAST(transaction_fee AS INTEGER) ELSE 0 END), 0) as total_fees,
           COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as successful,
           COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
         FROM transactions
@@ -379,6 +574,7 @@ export class Database {
           reject(new Error(`Failed to get transaction metrics: ${err.message}`));
         } else {
           resolve({
+            totalRent: BigInt(row.total_rent || 0),
             totalFees: BigInt(row.total_fees || 0),
             successful: row.successful || 0,
             failed: row.failed || 0
@@ -466,4 +662,4 @@ export function getDatabase(): Database {
     throw new Error('Database not initialized. Call createDatabase() first.');
   }
   return databaseInstance;
-} 
+}

@@ -6,7 +6,7 @@ An automated bot for claiming storage rent fees on the Ergo blockchain. This bot
 
 - **Automated Scanning**: Continuously scans the Ergo blockchain for eligible boxes
 - **Smart Transaction Building**: Uses Fleet SDK for efficient transaction construction
-- **Secure Signing**: Integrates with Ergo AppKit for secure transaction signing
+- **Storage-Rent Spending**: Builds empty-proof storage-rent transactions with Fleet SDK
 - **Database Tracking**: SQLite database for tracking eligible boxes and transactions
 - **Comprehensive Logging**: Structured logging with multiple log levels and categories
 - **Safety Features**: Dry-run mode, balance checks, and transaction validation
@@ -17,7 +17,7 @@ An automated bot for claiming storage rent fees on the Ergo blockchain. This bot
 - Node.js 18 or higher
 - npm or yarn
 - Running Ergo node (local or remote)
-- Wallet with sufficient ERG balance for transaction fees
+- A REST-accessible Ergo node for transaction submission
 
 ## Installation
 
@@ -39,12 +39,12 @@ cp env.example .env
 
 4. Edit `.env` file with your configuration:
 ```bash
-# Required: Set your wallet credentials
+# Optional: set wallet credentials only if wallet address/status is needed
 WALLET_MNEMONIC="your twelve word mnemonic phrase here"
 WALLET_PASSWORD="your_wallet_password"
 
 # Optional: Adjust other settings as needed
-ERGO_NODE_URL=http://127.0.0.1:9053
+ERGO_NODE_URL=http://128.253.41.49:9053
 NETWORK_TYPE=mainnet
 MIN_RENT_THRESHOLD=100000000
 ```
@@ -55,10 +55,14 @@ MIN_RENT_THRESHOLD=100000000
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `ERGO_NODE_URL` | Ergo node API endpoint | `http://127.0.0.1:9053` | No |
+| `ERGO_NODE_URL` | Primary indexed Ergo node API endpoint | `http://128.253.41.49:9053` | No |
+| `ADDITIONAL_SUBMIT_NODE_URLS` | Extra REST submit nodes, comma/space separated | `http://213.239.193.208:9053,http://128.253.41.102:9053` | No |
+| `ENABLE_NODE_DISCOVERY` | Probe REST APIs from ergonodes host list | `true` | No |
+| `ENABLE_SUBMIT_BROADCAST` | Submit accepted transactions to all active REST nodes | `true` | No |
+| `CONFIRM_PRIMARY_BEFORE_BROADCAST` | Wait for primary-node confirmation before fanout | `false` | No |
 | `NETWORK_TYPE` | Network type (`mainnet` or `testnet`) | `mainnet` | No |
-| `WALLET_MNEMONIC` | Wallet mnemonic phrase | - | **Yes** |
-| `WALLET_PASSWORD` | Wallet password | - | **Yes** |
+| `WALLET_MNEMONIC` | Optional wallet mnemonic phrase | - | No |
+| `WALLET_PASSWORD` | Optional wallet password | - | No |
 | `MIN_RENT_THRESHOLD` | Minimum rent fee to collect (nanoergs) | `100000000` (0.1 ERG) | No |
 | `MAX_BOXES_PER_TX` | Maximum boxes per transaction | `50` | No |
 | `RENT_FEE_PER_BYTE` | Rent fee per byte (nanoergs) | `1250000` | No |
@@ -71,7 +75,7 @@ MIN_RENT_THRESHOLD=100000000
 Based on [Ergo's storage rent documentation](https://docs.ergoplatform.com/mining/rent/rent-fees/):
 
 - **Rent Period**: 4 years (1,051,200 blocks)
-- **Default Rent Fee**: 1,250,000 nanoergs per byte
+- **Default Rent Fee**: 1,250,000 nanoergs per byte, but live node parameters are used at runtime
 - **Average Box Size**: ~105 bytes
 - **Typical Rent Fee**: ~0.13 ERG per standard box
 
@@ -136,10 +140,11 @@ npm start -- --help
 - Uses Fleet SDK to construct transactions
 - Preserves all box properties except creation info
 - Deducts rent fees from box values
-- Adds wallet change output to collect rent
+- Pays collected ERG as miner fee; tokens are preserved when the protocol requires recreation and burned when an underfunded expired box can be consumed
+- Submits to the primary node first, then fans out to active REST nodes discovered from configured URLs and ergonodes hosts
 
-### 3. Transaction Signing & Submission
-- Signs transactions using Ergo AppKit
+### 3. Transaction Submission
+- Uses empty storage-rent proofs for expired-box spending
 - Submits to the Ergo network
 - Monitors for confirmation
 - Updates database with results
@@ -178,10 +183,9 @@ Set `DRY_RUN=true` to test the bot without submitting actual transactions:
 DRY_RUN=true ./run-bot.sh start
 ```
 
-### Balance Checks
-- Validates wallet balance before starting
-- Ensures sufficient funds for transaction fees
-- Configurable minimum balance threshold
+### Fee Handling
+- Pays storage rent as miner fee output
+- Does not require wallet UTXOs for fee-only storage rent transactions
 
 ### Transaction Validation
 - Validates box eligibility before processing
@@ -307,4 +311,4 @@ This software is provided as-is. Users are responsible for:
 - Monitoring bot operation
 - Understanding Ergo storage rent mechanics
 
-Use at your own risk. The authors are not responsible for any losses. 
+Use at your own risk. The authors are not responsible for any losses.
