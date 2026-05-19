@@ -175,7 +175,9 @@ async function main(): Promise<void> {
       dryRun: config.dryRun,
       enableUi: config.enableUi,
       storageRentMode: config.storageRentMode,
-      storageRentCollectAddress: config.storageRentCollectAddress
+      storageRentCollectAddress: config.storageRentCollectAddress,
+      enableAssetSubsidy: config.enableAssetSubsidy,
+      maxAssetSubsidyNanoErgs: config.maxAssetSubsidyNanoErgs
     });
     
     // Initialize logger

@@ -1,10 +1,21 @@
-import { EligibleBox, Config, StorageRentParameters } from '../types';
+import { EligibleBox, Config, StorageRentParameters, BoxData } from '../types';
 import { TransactionBuilder, OutputBuilder, ErgoAddress, ErgoUnsignedInput, SShort } from '@fleet-sdk/core';
 import { estimateBoxSize } from '@fleet-sdk/serializer';
 import * as ergo from 'ergo-lib-wasm-nodejs';
 import axios from 'axios';
 import jsonBigInt from 'json-bigint';
 import { getAddressFromMnemonic, createWallet } from '../utils/ergoUtils';
+
+type StorageRentBuildResult = {
+  unsignedTx: any;
+  inputBoxes: any[];
+  walletInputIndexes: number[];
+  walletSubsidy: bigint;
+  totalRentCollected: bigint;
+  minerFee: bigint;
+  collectorValue: bigint;
+  collectorTokenCount: number;
+};
 
 export class TransactionService {
   private config: Config;
@@ -17,7 +28,7 @@ export class TransactionService {
 
   // Initialize wallet address from mnemonic
   private initializeWalletAddress(): void {
-    if (!this.config.walletMnemonic || !this.config.walletPassword) {
+    if (!this.config.walletMnemonic || this.config.walletPassword === undefined) {
       this.walletAddress = '';
       return;
     }
@@ -62,6 +73,28 @@ export class TransactionService {
     return batches;
   }
 
+  private async mapWithConcurrency<T, R>(
+    items: T[],
+    concurrency: number,
+    mapper: (item: T, index: number) => Promise<R>
+  ): Promise<R[]> {
+    const results: R[] = [];
+    let nextIndex = 0;
+
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex++;
+        const item = items[index];
+        if (item !== undefined) {
+          results[index] = await mapper(item, index);
+        }
+      }
+    });
+
+    await Promise.all(workers);
+    return results;
+  }
+
   // Build storage rent transaction using Fleet SDK
   async buildStorageRentTransaction(
     boxes: EligibleBox[],
@@ -69,21 +102,18 @@ export class TransactionService {
     currentHeight: number,
     ergoNode: any,
     rentParams: StorageRentParameters
-  ): Promise<{
-    unsignedTx: any;
-    inputBoxes: any[];
-    totalRentCollected: bigint;
-    minerFee: bigint;
-    collectorValue: bigint;
-    collectorTokenCount: number;
-  }> {
+  ): Promise<StorageRentBuildResult> {
     const spendHeight = currentHeight + 1;
     const fleetInputs: ErgoUnsignedInput[] = [];
+    const inputBoxes: any[] = [];
+    const walletInputIndexes: number[] = [];
     const outputs: OutputBuilder[] = [];
     const burnedTokenAmounts = new Map<string, bigint>();
     const collectedTokenAmounts = new Map<string, bigint>();
     const collectAddress = this.getStorageRentCollectAddress();
     let collectedInputValue = 0n;
+    let walletSubsidy = 0n;
+    let walletInputValue = 0n;
     const plans: Array<{
       input: ErgoUnsignedInput;
       boxId: string;
@@ -100,10 +130,26 @@ export class TransactionService {
     const addCollectedToken = (tokenId: string, amount: bigint): void => {
       collectedTokenAmounts.set(tokenId, (collectedTokenAmounts.get(tokenId) || 0n) + amount);
     };
+    const nodeBoxes = await this.mapWithConcurrency(
+      boxes,
+      Math.max(1, Math.min(this.config.scanBoxDetailConcurrency, boxes.length)),
+      async box => {
+        if (box.boxData) {
+          return box.boxData;
+        }
 
-    for (const box of boxes) {
-      try {
         const nodeBoxData = await ergoNode.getBoxById(box.boxId);
+        if (!nodeBoxData) {
+          throw new Error(`Box ${box.boxId} not found or already spent`);
+        }
+
+        return nodeBoxData;
+      }
+    );
+
+    for (const [index, box] of boxes.entries()) {
+      try {
+        const nodeBoxData = nodeBoxes[index];
         if (!nodeBoxData) {
           throw new Error(`Box ${box.boxId} not found or already spent`);
         }
@@ -113,32 +159,32 @@ export class TransactionService {
         const storageFee = BigInt(boxSize) * BigInt(rentParams.storageFeeFactor);
         const fleetInput = new ErgoUnsignedInput(nodeBoxData);
         const inputAssets = nodeBoxData.assets || [];
+        const canCollectAssets = collectAddress && inputAssets.length > 0;
 
-        if (inputValue <= storageFee) {
+        if (canCollectAssets) {
           fleetInputs.push(fleetInput);
-          const shouldCollectAssets = collectAddress !== null && inputAssets.length > 0;
-
-          if (shouldCollectAssets) {
-            collectedInputValue += inputValue;
-            for (const asset of inputAssets) {
-              addCollectedToken(asset.tokenId, BigInt(asset.amount));
-            }
-          } else {
-            for (const asset of inputAssets) {
-              addBurnedToken(asset.tokenId, BigInt(asset.amount));
-            }
+          inputBoxes.push(nodeBoxData);
+          for (const asset of inputAssets) {
+            addCollectedToken(asset.tokenId, BigInt(asset.amount));
           }
 
+          collectedInputValue += inputValue;
           plans.push({
             input: fleetInput,
             boxId: box.boxId,
-            mode: shouldCollectAssets ? 'collect' : 'consume',
-            feeContribution: shouldCollectAssets ? 0n : inputValue,
+            mode: 'collect',
+            feeContribution: 0n,
             inputValue,
             outputValue: 0n,
             storageFee
           });
           continue;
+        }
+
+        if (inputValue <= storageFee) {
+          throw new Error(
+            `Box ${box.boxId} has only ${inputValue} nanoErgs for ${storageFee} nanoErgs of storage rent; underfunded boxes need an external subsidy input`
+          );
         }
 
         const targetAddress = ErgoAddress.fromErgoTree(nodeBoxData.ergoTree);
@@ -164,6 +210,7 @@ export class TransactionService {
 
         const outputIndex = outputs.length;
         fleetInputs.push(fleetInput);
+        inputBoxes.push(nodeBoxData);
         outputs.push(output);
         plans.push({
           input: fleetInput,
@@ -189,27 +236,39 @@ export class TransactionService {
         amount
       }));
       const collectorOutput = new OutputBuilder('1', collectAddress)
-        .addTokens(collectedTokens);
+        .addTokens(collectedTokens)
+        .setCreationHeight(spendHeight);
       const minCollectorValue = BigInt(collectorOutput.estimateSize()) * BigInt(rentParams.minValuePerByte);
 
       if (collectedInputValue > minCollectorValue) {
         collectorValue = minCollectorValue;
-        collectorOutput.setValue(collectorValue.toString());
-        collectorOutputIndex = outputs.length;
-        outputs.push(collectorOutput);
-      } else {
-        for (const token of collectedTokens) {
-          addBurnedToken(token.tokenId, token.amount);
+      } else if (this.config.enableAssetSubsidy) {
+        walletSubsidy = minCollectorValue;
+        const maxSubsidy = BigInt(this.config.maxAssetSubsidyNanoErgs);
+        if (walletSubsidy > maxSubsidy) {
+          throw new Error(
+            `Asset subsidy ${walletSubsidy} nanoErgs exceeds MAX_ASSET_SUBSIDY_NANOERGS=${maxSubsidy}`
+          );
         }
 
-        collectedTokenAmounts.clear();
-        for (const plan of plans) {
-          if (plan.mode === 'collect') {
-            plan.mode = 'consume';
-            plan.feeContribution = plan.inputValue;
-          }
-        }
+        collectorValue = minCollectorValue;
+        walletInputValue = await this.addWalletSubsidyInputs(
+          ergoNode,
+          changeAddress,
+          walletSubsidy,
+          fleetInputs,
+          inputBoxes,
+          walletInputIndexes
+        );
+      } else {
+        throw new Error(
+          `Asset collection needs ${minCollectorValue} nanoErgs for the collector output; enable ENABLE_ASSET_SUBSIDY or skip this box`
+        );
       }
+
+      collectorOutput.setValue(collectorValue.toString());
+      collectorOutputIndex = outputs.length;
+      outputs.push(collectorOutput);
     }
 
     const feeOutputIndex = outputs.length;
@@ -222,10 +281,15 @@ export class TransactionService {
       plan.input.setContextExtension({ 127: SShort(targetOutputIndex) });
     }
 
-    const totalInputValue = plans.reduce((sum, plan) => sum + plan.inputValue, 0n);
+    const totalStorageRentInputValue = plans.reduce((sum, plan) => sum + plan.inputValue, 0n);
+    const totalInputValue = totalStorageRentInputValue + walletInputValue;
     const totalRecreatedValue = plans.reduce((sum, plan) => sum + plan.outputValue, 0n);
     const planFeeContribution = plans.reduce((sum, plan) => sum + plan.feeContribution, 0n);
-    const collectFeeContribution = collectorOutputIndex === undefined ? 0n : collectedInputValue - collectorValue;
+    const collectFeeContribution = collectorOutputIndex === undefined
+      ? 0n
+      : walletSubsidy > 0n
+        ? collectedInputValue
+        : collectedInputValue - collectorValue;
     const minerFee = planFeeContribution + collectFeeContribution;
     const totalRentCollected = planFeeContribution + (collectorOutputIndex === undefined ? 0n : collectedInputValue);
     const burnedTokens = Array.from(burnedTokenAmounts.entries()).map(([tokenId, amount]) => ({
@@ -242,6 +306,8 @@ export class TransactionService {
     console.log(`Mode: ${this.config.storageRentMode}`);
     console.log(`Spend height: ${spendHeight}`);
     console.log(`Total input value: ${totalInputValue} nanoErgs`);
+    console.log(`Storage-rent input value: ${totalStorageRentInputValue} nanoErgs`);
+    console.log(`Wallet subsidy: ${walletSubsidy} nanoErgs`);
     console.log(`Recreated value: ${totalRecreatedValue} nanoErgs`);
     console.log(`Collector value: ${collectorValue} nanoErgs`);
     console.log(`Collector token entries: ${collectorTokenCount}`);
@@ -266,18 +332,84 @@ export class TransactionService {
         .configure(settings => settings.allowTokenBurning());
     }
 
+    if (walletInputIndexes.length > 0) {
+      txBuilder = txBuilder.sendChangeTo(changeAddress);
+    }
+
     const unsignedTx = txBuilder
       .build()
       .toEIP12Object();
 
     return {
       unsignedTx,
-      inputBoxes: fleetInputs,
+      inputBoxes,
+      walletInputIndexes,
+      walletSubsidy,
       totalRentCollected,
       minerFee,
       collectorValue,
       collectorTokenCount
     };
+  }
+
+  private async addWalletSubsidyInputs(
+    ergoNode: any,
+    changeAddress: string,
+    requiredValue: bigint,
+    fleetInputs: ErgoUnsignedInput[],
+    inputBoxes: any[],
+    walletInputIndexes: number[]
+  ): Promise<bigint> {
+    if (requiredValue <= 0n) {
+      return 0n;
+    }
+
+    if (!changeAddress || !this.config.walletMnemonic || this.config.walletPassword === undefined) {
+      throw new Error('Wallet mnemonic is required for asset subsidy inputs');
+    }
+
+    const excludedBoxIds = new Set(inputBoxes.map(box => box.boxId));
+    const walletUtxos = await ergoNode.getWalletUtxos(changeAddress);
+    const { boxes, totalValue } = this.selectWalletSubsidyBoxes(walletUtxos, requiredValue, excludedBoxIds);
+
+    for (const walletBox of boxes) {
+      walletInputIndexes.push(fleetInputs.length);
+      fleetInputs.push(new ErgoUnsignedInput(walletBox));
+      inputBoxes.push(walletBox);
+    }
+
+    return totalValue;
+  }
+
+  private selectWalletSubsidyBoxes(
+    utxos: BoxData[],
+    requiredValue: bigint,
+    excludedBoxIds: Set<string>
+  ): { boxes: BoxData[]; totalValue: bigint } {
+    const candidates = utxos
+      .filter(box => !excludedBoxIds.has(box.boxId))
+      .filter(box => (box.assets || []).length === 0)
+      .sort((a, b) => {
+        const aValue = BigInt(a.value);
+        const bValue = BigInt(b.value);
+        if (aValue === bValue) {
+          return 0;
+        }
+        return aValue < bValue ? -1 : 1;
+      });
+
+    const selected: BoxData[] = [];
+    let totalValue = 0n;
+
+    for (const box of candidates) {
+      selected.push(box);
+      totalValue += BigInt(box.value);
+      if (totalValue >= requiredValue) {
+        return { boxes: selected, totalValue };
+      }
+    }
+
+    throw new Error(`Wallet has no pure ERG UTXO set covering ${requiredValue} nanoErgs for asset subsidy`);
   }
 
   // Sign and submit transaction using ergo-lib-wasm (fromUnsigned function)
@@ -293,8 +425,16 @@ export class TransactionService {
     }
   }
 
-  createSignedStorageRentTransaction(unsignedTxJson: any): { txId: string; signedTx: string } {
-    return this.createStorageRentSignedTx(unsignedTxJson);
+  async createSignedStorageRentTransaction(
+    unsignedTxJson: any,
+    inputBoxes: any[] = [],
+    walletInputIndexes: number[] = []
+  ): Promise<{ txId: string; signedTx: string }> {
+    if (walletInputIndexes.length === 0) {
+      return this.createStorageRentSignedTx(unsignedTxJson);
+    }
+
+    return this.createMixedStorageRentSignedTx(unsignedTxJson, inputBoxes, walletInputIndexes);
   }
 
   // Create signed transaction for storage rent (no actual signing needed)
@@ -324,6 +464,46 @@ export class TransactionService {
     };
   }
 
+  private async createMixedStorageRentSignedTx(
+    unsignedTxJson: any,
+    inputBoxes: any[],
+    walletInputIndexes: number[]
+  ): Promise<{ txId: string; signedTx: string }> {
+    if (inputBoxes.length !== unsignedTxJson.inputs.length) {
+      throw new Error(`Cannot sign subsidized transaction: ${inputBoxes.length} input boxes for ${unsignedTxJson.inputs.length} unsigned inputs`);
+    }
+
+    const unsignedTx = ergo.UnsignedTransaction.from_json(jsonBigInt.stringify(unsignedTxJson));
+    const txId = unsignedTx.id().to_str();
+    const ctx = await this.getErgoStateContext();
+    const wallet = this.createWallet();
+    const boxesToSpend = ergo.ErgoBoxes.from_boxes_json(inputBoxes);
+    const dataBoxes = ergo.ErgoBoxes.from_boxes_json([]);
+    const walletIndexSet = new Set(walletInputIndexes);
+    const proofs = unsignedTxJson.inputs.map(() => new Uint8Array());
+
+    for (const inputIndex of walletIndexSet) {
+      if (inputIndex < 0 || inputIndex >= unsignedTxJson.inputs.length) {
+        throw new Error(`Wallet input index ${inputIndex} is outside unsigned transaction inputs`);
+      }
+
+      const signedInput = wallet.sign_tx_input(inputIndex, ctx, unsignedTx, boxesToSpend, dataBoxes);
+      proofs[inputIndex] = signedInput.spending_proof().proof();
+    }
+
+    const signedTx = ergo.Transaction.from_unsigned_tx(unsignedTx, proofs).to_js_eip12();
+
+    console.log(
+      `Signed subsidized storage-rent transaction ${txId}: inputs=${unsignedTxJson.inputs.length}, ` +
+      `walletInputs=${walletIndexSet.size}, outputs=${unsignedTxJson.outputs.length}`
+    );
+
+    return {
+      txId,
+      signedTx: jsonBigInt.stringify(signedTx)
+    };
+  }
+
 
   // Sign transaction with wallet mnemonic
   private async signTx(unsignedTx: any, inputs: any): Promise<any> {
@@ -337,8 +517,8 @@ export class TransactionService {
 
   // Create wallet from mnemonic
   private createWallet(): any {
-    if (!this.config.walletMnemonic || !this.config.walletPassword) {
-      throw new Error('Wallet mnemonic/password are not configured');
+    if (!this.config.walletMnemonic || this.config.walletPassword === undefined) {
+      throw new Error('Wallet mnemonic is not configured');
     }
 
     return createWallet(this.config.walletMnemonic, this.config.walletPassword);

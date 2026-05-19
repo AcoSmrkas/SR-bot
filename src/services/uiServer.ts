@@ -323,7 +323,8 @@ export class UIServer {
       }
 
       const currentSpendHeight = spendHeight ?? box.currentHeight + 1;
-      return box.creationHeight + this.config.minStorageRentAgeBlocks >= currentSpendHeight;
+      const blocksUntilClaimable = box.creationHeight + this.config.minStorageRentAgeBlocks - currentSpendHeight;
+      return blocksUntilClaimable <= this.config.scanFutureBlockWindow;
     });
 
     for (const box of liveBoxes) {

@@ -51,8 +51,12 @@ export interface Config {
   // Transaction Configuration
   transactionFee: number;
   maxTransactionSize: number;
+  transactionFinalityCheckMs: number;
+  transactionFinalityGraceBlocks: number;
   storageRentMode: 'miner' | 'address';
   storageRentCollectAddress?: string;
+  enableAssetSubsidy: boolean;
+  maxAssetSubsidyNanoErgs: number;
 
   // Bot Behavior
   dryRun: boolean;
@@ -139,6 +143,7 @@ export interface EligibleBox {
     amount: bigint;
   }>;
   additionalRegisters: Record<string, string>;
+  boxData?: BoxData;
 }
 
 export interface TransactionResult {

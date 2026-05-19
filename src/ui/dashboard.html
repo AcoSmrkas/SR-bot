@@ -421,11 +421,9 @@
         }
 
         els.queueRows.innerHTML = snapshot.queue.map(group => {
-          const blocks = group.blocksUntilClaimable < 0
-            ? `${Math.abs(group.blocksUntilClaimable)} blocks overdue`
-            : group.blocksUntilClaimable === 0
-              ? 'eligible now'
-              : `${group.blocksUntilClaimable} blocks`;
+          const blocks = group.blocksUntilClaimable <= 0
+            ? 'eligible now'
+            : `${group.blocksUntilClaimable} blocks`;
           const statuses = Object.entries(group.statusCounts).map(([key, count]) => `${key}:${count}`).join(' ');
           return `
             <tr>

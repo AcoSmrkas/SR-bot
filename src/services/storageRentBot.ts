@@ -8,6 +8,9 @@ type TransactionFinality = {
   confirmed: boolean;
   conflictTxId?: string;
   expired?: boolean;
+  timedOut?: boolean;
+  currentHeight?: number;
+  expiryHeight?: number;
 };
 
 type BoxReconciliation = {
@@ -15,6 +18,7 @@ type BoxReconciliation = {
   requeued: number;
   conflicted: number;
   retired: number;
+  pending: number;
 };
 
 export class StorageRentBot {
@@ -29,6 +33,9 @@ export class StorageRentBot {
   private queuedBoxesByHeight: Map<number, EligibleBox[]> = new Map();
   private lastScanCursor: number = 0;
   private lastNextEligibleLogKey: string | null = null;
+  private lastIndexedBehindLogKey: string | null = null;
+  private pendingRecoveryComplete: boolean = false;
+  private monitoredTransactionIds: Set<string> = new Set();
   private startTime: Date;
   private logger: any; // Will be injected
 
@@ -69,6 +76,8 @@ export class StorageRentBot {
       // Store initialization time
       await this.database.setBotState('initialized_at', new Date().toISOString());
       await this.database.setBotState('storage_rent_mode', this.config.storageRentMode);
+      await this.database.setBotState('asset_subsidy_enabled', String(this.config.enableAssetSubsidy));
+      await this.database.setBotState('max_asset_subsidy_nanoergs', String(this.config.maxAssetSubsidyNanoErgs));
       await this.database.setBotState('wallet_address', this.getDisplayedWalletAddress());
       if (this.config.storageRentCollectAddress) {
         await this.database.setBotState('storage_rent_collect_address', this.config.storageRentCollectAddress);
@@ -80,6 +89,8 @@ export class StorageRentBot {
       this.logger.info('Storage Rent Bot initialized successfully', {
         component: 'bot',
         storageRentMode: this.config.storageRentMode,
+        enableAssetSubsidy: this.config.enableAssetSubsidy,
+        maxAssetSubsidyNanoErgs: this.config.maxAssetSubsidyNanoErgs,
         walletAddress: this.getDisplayedWalletAddress(),
         signingWalletAddress: this.transactionService.getWalletAddress()
       });
@@ -204,6 +215,11 @@ export class StorageRentBot {
       const rentParams = await this.ergoNode.getStorageRentParameters();
       const spendHeight = currentHeight + 1;
 
+      if (!this.pendingRecoveryComplete) {
+        await this.recoverPendingTransactions(rentParams.storagePeriodBlocks);
+        this.pendingRecoveryComplete = true;
+      }
+
       if (this.queuedBoxesByHeight.size === 0) {
         const restoredBoxes = await this.restoreQueuedBoxesFromDatabase(currentHeight, spendHeight, rentParams.storagePeriodBlocks);
         if (restoredBoxes > 0) {
@@ -212,12 +228,18 @@ export class StorageRentBot {
       }
 
       if (bestSubmitNode && bestSubmitNode.fullHeight > indexedHeight) {
-        this.logger.info('Indexed node is behind submit network; using submit height for eligibility', {
-          component: 'bot',
-          indexedHeight,
-          submitHeight: bestSubmitNode.fullHeight,
-          submitNode: bestSubmitNode.url
-        });
+        const logKey = `${indexedHeight}:${bestSubmitNode.fullHeight}:${bestSubmitNode.url}`;
+        if (this.lastIndexedBehindLogKey !== logKey) {
+          this.lastIndexedBehindLogKey = logKey;
+          this.logger.info('Indexed node is behind submit network; using submit height for eligibility', {
+            component: 'bot',
+            indexedHeight,
+            submitHeight: bestSubmitNode.fullHeight,
+            submitNode: bestSubmitNode.url
+          });
+        }
+      } else {
+        this.lastIndexedBehindLogKey = null;
       }
 
       // When the queue is empty, scan once per new block so we do not sleep through the next rent boundary.
@@ -239,18 +261,6 @@ export class StorageRentBot {
 
         // Merge new boxes into our existing queue by height
         for (const [height, boxes] of boxesByHeight) {
-          const claimableAtHeight = height + rentParams.storagePeriodBlocks;
-          if (claimableAtHeight < spendHeight) {
-            this.logger.debug('Skipping stale scanned storage-rent height group', {
-              component: 'bot',
-              height,
-              boxCount: boxes.length,
-              claimableAtHeight,
-              spendHeight
-            });
-            continue;
-          }
-
           if (!this.queuedBoxesByHeight.has(height)) {
             this.queuedBoxesByHeight.set(height, []);
           }
@@ -264,12 +274,12 @@ export class StorageRentBot {
             }
 
             if (existingBox?.txId && existingBox.status === 'pending') {
-              const pendingBoxCanBeRetried = spendHeight === existingBox.creationHeight + rentParams.storagePeriodBlocks;
-              if (!pendingBoxCanBeRetried) {
-                continue;
-              }
+              continue;
+            }
 
-              await this.database.updateBoxStatus(box.boxId, 'queued', undefined);
+            const existingFailedAssetBox = existingBox?.status === 'error' && existingBox.assets.length > 0;
+            if (existingFailedAssetBox || existingBox?.status === 'insufficient_funds') {
+              continue;
             }
 
             await this.database.insertEligibleBox(box);
@@ -302,19 +312,14 @@ export class StorageRentBot {
 
       // Find all boxes from heights that are now eligible
       const eligibleGroups: Array<{ height: number; boxes: EligibleBox[] }> = [];
-      const staleGroups: Array<{ height: number; boxes: EligibleBox[]; missedByBlocks: number }> = [];
       const heightsToRemove: number[] = [];
 
       for (const [height, boxes] of this.queuedBoxesByHeight) {
         const eligibleAtHeight = height + minAge;
-        const isEligible = spendHeight === eligibleAtHeight; // Claim in the next block that can include it.
-        const isStale = spendHeight > eligibleAtHeight;
+        const isEligible = spendHeight >= eligibleAtHeight;
 
         if (isEligible) {
           eligibleGroups.push({ height, boxes });
-          heightsToRemove.push(height);
-        } else if (isStale) {
-          staleGroups.push({ height, boxes, missedByBlocks: spendHeight - eligibleAtHeight });
           heightsToRemove.push(height);
         }
       }
@@ -322,24 +327,6 @@ export class StorageRentBot {
       // Remove processed height groups from queue
       for (const height of heightsToRemove) {
         this.queuedBoxesByHeight.delete(height);
-      }
-
-      for (const group of staleGroups) {
-        const reconciliation = await this.reconcileUnconfirmedBoxes(
-          group.boxes.map(box => box.boxId),
-          '',
-          { requeueUnspent: false }
-        );
-
-        this.logger.warn('Retired stale storage-rent height group from queue', {
-          component: 'processor',
-          height: group.height,
-          boxCount: group.boxes.length,
-          missedByBlocks: group.missedByBlocks,
-          claimed: reconciliation.claimed,
-          conflicted: reconciliation.conflicted,
-          retired: reconciliation.retired
-        });
       }
 
       const nowEligibleCount = eligibleGroups.reduce((sum, group) => sum + group.boxes.length, 0);
@@ -449,32 +436,17 @@ export class StorageRentBot {
     const cutoffHeight = spendHeight - minAge;
     const oldestCreationHeight = cutoffHeight - this.config.scanFutureBlockWindow;
     const newestCreationHeight = cutoffHeight + this.config.scanFutureBlockWindow;
-    const queuedBoxes = [
-      ...await this.database.getEligibleBoxes('queued'),
-      ...await this.database.getEligibleBoxes('pending')
-    ];
+    const queuedBoxes = await this.database.getEligibleBoxes('queued');
     let restoredCount = 0;
-    let retiredStaleCount = 0;
 
     for (const box of queuedBoxes) {
       if (box.creationHeight < oldestCreationHeight || box.creationHeight > newestCreationHeight) {
         continue;
       }
 
-      const claimableAtHeight = box.creationHeight + minAge;
-      if (claimableAtHeight < spendHeight) {
-        const reconciliation = await this.reconcileUnconfirmedBoxes([box.boxId], box.txId ?? '', { requeueUnspent: false });
-        retiredStaleCount += reconciliation.claimed + reconciliation.conflicted + reconciliation.retired;
-        continue;
-      }
-
       const spentTxId = await this.ergoNode.getBoxSpentTransactionId(box.boxId).catch(() => null);
       if (spentTxId) {
         continue;
-      }
-
-      if (box.status === 'pending') {
-        await this.database.updateBoxStatus(box.boxId, 'queued', undefined);
       }
 
       if (!this.queuedBoxesByHeight.has(box.creationHeight)) {
@@ -499,14 +471,36 @@ export class StorageRentBot {
       });
     }
 
-    if (retiredStaleCount > 0) {
-      this.logger.info('Retired stale queued boxes from database', {
-        component: 'bot',
-        retiredStaleCount
-      });
+    return restoredCount;
+  }
+
+  private async recoverPendingTransactions(minAge: number): Promise<void> {
+    const pendingTransactions = await this.database.getTransactions('pending');
+    let recoveredCount = 0;
+
+    for (const transaction of pendingTransactions) {
+      const boxes = await Promise.all(
+        transaction.boxIds.map(boxId => this.database.getBoxById(boxId).catch(() => null))
+      );
+      const box = boxes.find((item): item is EligibleBox => Boolean(item));
+      if (!box) {
+        continue;
+      }
+
+      this.startTransactionMonitor(
+        transaction.txId,
+        transaction.boxIds,
+        box.creationHeight + minAge
+      );
+      recoveredCount += 1;
     }
 
-    return restoredCount;
+    if (recoveredCount > 0) {
+      this.logger.info('Recovered pending transaction monitors', {
+        component: 'bot',
+        recoveredCount
+      });
+    }
   }
 
   private logNextEligibleSummary(
@@ -521,7 +515,7 @@ export class StorageRentBot {
     const claimableAtHeight = nextEligibleHeight + minAge;
     const blocksUntilClaimable = claimableAtHeight - spendHeight;
     const totalQueuedBoxes = Array.from(this.queuedBoxesByHeight.values()).reduce((sum, boxes) => sum + boxes.length, 0);
-    const logKey = `${nextEligibleHeight}:${nextEligibleBoxes.length}:${blocksUntilClaimable}:${totalQueuedBoxes}`;
+      const logKey = `${nextEligibleHeight}:${nextEligibleBoxes.length}:${blocksUntilClaimable}:${totalQueuedBoxes}`;
 
     if (this.lastNextEligibleLogKey === logKey) {
       return;
@@ -530,7 +524,10 @@ export class StorageRentBot {
     this.lastNextEligibleLogKey = logKey;
 
     const nextEligibleBoxIds = nextEligibleBoxes.slice(0, 5).map(box => box.boxId);
-    this.logger.info(`NEXT ELIGIBLE BOXES: ${nextEligibleBoxes.length} boxes at height ${nextEligibleHeight} will be claimable in ${blocksUntilClaimable} blocks (~${Math.round(blocksUntilClaimable * 2)} min)`, {
+    const claimableMessage = blocksUntilClaimable <= 0
+      ? 'claimable now'
+      : `will be claimable in ${blocksUntilClaimable} blocks (~${Math.round(blocksUntilClaimable * 2)} min)`;
+    this.logger.info(`NEXT ELIGIBLE BOXES: ${nextEligibleBoxes.length} boxes at height ${nextEligibleHeight} ${claimableMessage}`, {
       component: 'processor',
       currentHeight,
       spendHeight,
@@ -541,7 +538,7 @@ export class StorageRentBot {
       blocksUntilClaimable,
       nextEligibleCount: nextEligibleBoxes.length,
       nextEligibleBoxIds,
-      estimatedTimeMinutes: Math.round(blocksUntilClaimable * 2) // ~2 minutes per block
+      estimatedTimeMinutes: Math.max(Math.round(blocksUntilClaimable * 2), 0) // ~2 minutes per block
     });
 
     this.logger.info(`Next eligible box IDs: ${nextEligibleBoxIds.join(', ')}${nextEligibleBoxes.length > 5 ? ` ...and ${nextEligibleBoxes.length - 5} more` : ''}`, { component: 'processor' });
@@ -551,7 +548,8 @@ export class StorageRentBot {
       const boxes = this.queuedBoxesByHeight.get(height)!;
       const claimableAt = height + minAge;
       const blocksUntil = claimableAt - spendHeight;
-      this.logger.info(`  Height ${height}: ${boxes.length} boxes -> eligible in ${blocksUntil} blocks`, { component: 'processor' });
+      const summary = blocksUntil <= 0 ? 'eligible now' : `eligible in ${blocksUntil} blocks`;
+      this.logger.info(`  Height ${height}: ${boxes.length} boxes -> ${summary}`, { component: 'processor' });
     }
   }
 
@@ -596,9 +594,12 @@ export class StorageRentBot {
         }
       }
 
-      // Validate the passed eligible boxes are still unspent
-      const boxIds = eligibleBoxes.map(box => box.boxId);
-      const validation = await this.ergoNode.validateBoxes(boxIds, currentHeight, rentParams);
+      const cachedBoxes = eligibleBoxes.filter(box => box.boxData);
+      const uncachedBoxes = eligibleBoxes.filter(box => !box.boxData);
+      const uncachedBoxIds = uncachedBoxes.map(box => box.boxId);
+      const validation = uncachedBoxIds.length > 0
+        ? await this.ergoNode.validateBoxes(uncachedBoxIds, currentHeight, rentParams)
+        : { valid: [], invalid: [] };
 
       // Update invalid boxes in database
       for (const invalidBoxId of validation.invalid) {
@@ -606,9 +607,19 @@ export class StorageRentBot {
       }
 
       // Filter to only valid boxes
-      const validBoxes = eligibleBoxes.filter(box =>
-        validation.valid.includes(box.boxId)
-      );
+      const validUncachedBoxIds = new Set(validation.valid);
+      const validBoxes = [
+        ...cachedBoxes,
+        ...uncachedBoxes.filter(box => validUncachedBoxIds.has(box.boxId))
+      ];
+
+      if (cachedBoxes.length > 0) {
+        this.logger.info('Using cached scan box payloads for transaction build', {
+          component: 'processor',
+          cachedBoxes: cachedBoxes.length,
+          remoteValidatedBoxes: uncachedBoxes.length
+        });
+      }
 
       if (validBoxes.length === 0) {
         this.logger.info('No valid boxes to process', { component: 'processor' });
@@ -699,25 +710,27 @@ export class StorageRentBot {
       errors: []
     };
 
+    let batchBoxes = boxes;
+
     try {
       this.logger.info('Processing batch', {
         component: 'processor',
         batchIndex,
         totalBatches,
-        batchSize: boxes.length
+        batchSize: batchBoxes.length
       });
 
       const changeAddress = this.transactionService.getWalletAddress();
       const buildTransactionAtHeight = async (height: number) => {
         const builtTransaction = await this.transactionService.buildStorageRentTransaction(
-          boxes,
+          batchBoxes,
           changeAddress,
           height,
           this.ergoNode,
           rentParams
         );
 
-        const validation = await this.transactionService.validateTransaction(boxes, builtTransaction.unsignedTx);
+        const validation = await this.transactionService.validateTransaction(batchBoxes, builtTransaction.unsignedTx);
         if (!validation.valid) {
           throw new Error(`Transaction validation failed: ${validation.errors.join(', ')}`);
         }
@@ -727,34 +740,93 @@ export class StorageRentBot {
 
       let submitNode = this.config.dryRun ? null : await this.ergoNode.getBestSubmitNode(true);
       let buildHeight = submitNode?.fullHeight ?? await this.ergoNode.getPrimarySubmitHeight();
-      let { unsignedTx, totalRentCollected, minerFee, collectorValue, collectorTokenCount } = await buildTransactionAtHeight(buildHeight);
+      if (submitNode) {
+        const liveValidation = await this.ergoNode.validateBoxesOnNode(
+          submitNode.url,
+          batchBoxes.map(box => box.boxId),
+          buildHeight,
+          rentParams
+        );
+
+        for (const invalidBoxId of liveValidation.invalid) {
+          await this.database.updateBoxStatus(invalidBoxId, 'error', undefined);
+        }
+
+        if (liveValidation.invalid.length > 0) {
+          this.logger.warn('Submit node UTXO check removed unavailable boxes from batch', {
+            component: 'processor',
+            batchIndex,
+            submitNode: submitNode.url,
+            submitNodeHeight: buildHeight,
+            validBoxes: liveValidation.valid.length,
+            invalidBoxes: liveValidation.invalid.length
+          });
+        }
+
+        const validBoxIds = new Set(liveValidation.valid);
+        batchBoxes = batchBoxes.filter(box => validBoxIds.has(box.boxId));
+        if (batchBoxes.length === 0) {
+          this.logger.info('No live UTXO boxes left in batch after submit-node check', {
+            component: 'processor',
+            batchIndex,
+            submitNode: submitNode.url,
+            submitNodeHeight: buildHeight
+          });
+          return result;
+        }
+      }
+
+      let {
+        unsignedTx,
+        inputBoxes,
+        walletInputIndexes,
+        walletSubsidy,
+        totalRentCollected,
+        minerFee,
+        collectorValue,
+        collectorTokenCount
+      } = await buildTransactionAtHeight(buildHeight);
       let transactionFee = minerFee;
 
       if (this.config.dryRun) {
-        this.logger.info('DRY RUN: Would submit transaction', {
+	        this.logger.info('DRY RUN: Would submit transaction', {
           component: 'processor',
-	          boxCount: boxes.length,
-	          rentCollected: totalRentCollected.toString(),
-	          fee: transactionFee.toString(),
-	          collectorValue: collectorValue.toString(),
-	          collectorTokenCount
-	        });
+	          boxCount: batchBoxes.length,
+		          rentCollected: totalRentCollected.toString(),
+		          fee: transactionFee.toString(),
+		          collectorValue: collectorValue.toString(),
+              walletSubsidy: walletSubsidy.toString(),
+		          collectorTokenCount
+		        });
 
         // Update result for dry run
-        result.processedBoxes = boxes.length;
+        result.processedBoxes = batchBoxes.length;
         result.successfulTransactions = 1;
         result.totalRentCollected = totalRentCollected;
         result.totalFeesPaid = transactionFee;
 
       } else {
         if (!submitNode) {
-	          submitNode = await this.ergoNode.getBestSubmitNode(true);
-	          buildHeight = submitNode.fullHeight;
-	          ({ unsignedTx, totalRentCollected, minerFee, collectorValue, collectorTokenCount } = await buildTransactionAtHeight(buildHeight));
-	          transactionFee = minerFee;
-	        }
+		          submitNode = await this.ergoNode.getBestSubmitNode(true);
+		          buildHeight = submitNode.fullHeight;
+		          ({
+                unsignedTx,
+                inputBoxes,
+                walletInputIndexes,
+                walletSubsidy,
+                totalRentCollected,
+                minerFee,
+                collectorValue,
+                collectorTokenCount
+              } = await buildTransactionAtHeight(buildHeight));
+		          transactionFee = minerFee;
+		        }
 
-        let { txId, signedTx } = this.transactionService.createSignedStorageRentTransaction(unsignedTx);
+	        let { txId, signedTx } = await this.transactionService.createSignedStorageRentTransaction(
+            unsignedTx,
+            inputBoxes,
+            walletInputIndexes
+          );
         const refreshedSubmitNode = await this.ergoNode.getBestSubmitNode(true);
         if (refreshedSubmitNode.fullHeight !== buildHeight) {
           this.logger.info('Submit node height changed while building transaction; rebuilding before submit', {
@@ -763,14 +835,61 @@ export class StorageRentBot {
             submitNodeHeight: refreshedSubmitNode.fullHeight,
             submitNode: refreshedSubmitNode.url,
             batchIndex,
-            batchSize: boxes.length
+            batchSize: batchBoxes.length
           });
 
 	          submitNode = refreshedSubmitNode;
 	          buildHeight = submitNode.fullHeight;
-	          ({ unsignedTx, totalRentCollected, minerFee, collectorValue, collectorTokenCount } = await buildTransactionAtHeight(buildHeight));
-	          transactionFee = minerFee;
-	          ({ txId, signedTx } = this.transactionService.createSignedStorageRentTransaction(unsignedTx));
+          const liveValidation = await this.ergoNode.validateBoxesOnNode(
+            submitNode.url,
+            batchBoxes.map(box => box.boxId),
+            buildHeight,
+            rentParams
+          );
+
+          for (const invalidBoxId of liveValidation.invalid) {
+            await this.database.updateBoxStatus(invalidBoxId, 'error', undefined);
+          }
+
+          if (liveValidation.invalid.length > 0) {
+            this.logger.warn('Submit node UTXO check removed unavailable boxes before rebuild', {
+              component: 'processor',
+              batchIndex,
+              submitNode: submitNode.url,
+              submitNodeHeight: buildHeight,
+              validBoxes: liveValidation.valid.length,
+              invalidBoxes: liveValidation.invalid.length
+            });
+          }
+
+          const validBoxIds = new Set(liveValidation.valid);
+          batchBoxes = batchBoxes.filter(box => validBoxIds.has(box.boxId));
+          if (batchBoxes.length === 0) {
+            this.logger.info('No live UTXO boxes left in batch after submit-node height refresh', {
+              component: 'processor',
+              batchIndex,
+              submitNode: submitNode.url,
+              submitNodeHeight: buildHeight
+            });
+            return result;
+          }
+
+		          ({
+                unsignedTx,
+                inputBoxes,
+                walletInputIndexes,
+                walletSubsidy,
+                totalRentCollected,
+                minerFee,
+                collectorValue,
+                collectorTokenCount
+              } = await buildTransactionAtHeight(buildHeight));
+		          transactionFee = minerFee;
+		          ({ txId, signedTx } = await this.transactionService.createSignedStorageRentTransaction(
+                unsignedTx,
+                inputBoxes,
+                walletInputIndexes
+              ));
         } else {
           submitNode = refreshedSubmitNode;
         }
@@ -832,7 +951,7 @@ export class StorageRentBot {
         }
 
         if (primaryAccepted && this.config.confirmPrimaryBeforeBroadcast) {
-          const finality = await this.waitForTransactionFinality(txId, boxes.map(box => box.boxId), buildHeight + 1);
+          const finality = await this.waitForTransactionFinality(txId, batchBoxes.map(box => box.boxId), buildHeight + 1);
           if (!finality.confirmed) {
             throw new Error(finality.conflictTxId
               ? `Primary transaction lost storage-rent race to ${finality.conflictTxId}`
@@ -852,7 +971,7 @@ export class StorageRentBot {
         // Create transaction record
         const transactionResult: TransactionResult = {
           txId,
-          boxIds: boxes.map(box => box.boxId),
+          boxIds: batchBoxes.map(box => box.boxId),
           totalRentCollected,
           transactionFee,
           status: 'pending',
@@ -863,7 +982,7 @@ export class StorageRentBot {
         await this.database.insertTransaction(transactionResult);
 
         // Broadcast acceptance is not confirmation. Keep boxes pending until chain monitoring proves our tx won.
-        for (const box of boxes) {
+        for (const box of batchBoxes) {
           await this.database.updateBoxStatus(box.boxId, 'pending', txId);
         }
 
@@ -871,11 +990,12 @@ export class StorageRentBot {
         this.logger.info('Storage rent transaction submitted', {
           component: 'processor',
           txId,
-	          boxIds: boxes.map(box => box.boxId),
+          boxIds: batchBoxes.map(box => box.boxId),
 	          rentCollected: totalRentCollected.toString(),
 	          fee: transactionFee.toString(),
-	          collectorValue: collectorValue.toString(),
-	          collectorTokenCount,
+		          collectorValue: collectorValue.toString(),
+              walletSubsidy: walletSubsidy.toString(),
+		          collectorTokenCount,
 	          primaryAccepted,
           primaryNode: submitNode.url,
           submitNodeHeight: buildHeight,
@@ -886,19 +1006,12 @@ export class StorageRentBot {
         });
 
         // Update result
-        result.processedBoxes = boxes.length;
+        result.processedBoxes = batchBoxes.length;
         result.successfulTransactions = 1;
         result.totalRentCollected = totalRentCollected;
         result.totalFeesPaid = transactionFee;
 
-        // Monitor transaction confirmation (async)
-        this.monitorTransactionConfirmation(txId, boxes.map(box => box.boxId), buildHeight + 1).catch(error => {
-          this.logger.error('Transaction monitoring failed', {
-            component: 'processor',
-            txId,
-            error: error as Error
-          });
-        });
+        this.startTransactionMonitor(txId, batchBoxes.map(box => box.boxId), buildHeight + 1);
       }
 
       return result;
@@ -912,17 +1025,17 @@ export class StorageRentBot {
 
       result.failedTransactions = 1;
       result.errors.push(`Batch ${batchIndex} failed: ${error}`);
+      const retryUnspentBoxes = !this.isNonRetryableBatchError(error);
 
-      const errorMessage = error instanceof Error ? error.message : String(error);
       const reconciliation = await this.reconcileUnconfirmedBoxes(
-        boxes.map(box => box.boxId),
+        batchBoxes.map(box => box.boxId),
         '',
-        { requeueUnspent: !this.isMempoolDoubleSpend(errorMessage) }
+        { requeueUnspent: retryUnspentBoxes }
       );
       if (reconciliation.requeued > 0 || reconciliation.retired > 0) {
-        this.logger.warn(reconciliation.requeued > 0
+        this.logger.warn(retryUnspentBoxes
           ? 'Batch failed; requeued unspent boxes'
-          : 'Batch failed from mempool conflict; retired unspent boxes', {
+          : 'Batch failed with non-retryable validation error; retired unspent boxes', {
           component: 'processor',
           batchIndex,
           requeued: reconciliation.requeued,
@@ -934,6 +1047,25 @@ export class StorageRentBot {
 
       return result;
     }
+  }
+
+  private startTransactionMonitor(txId: string, boxIds: string[], txSpendHeight: number): void {
+    if (this.monitoredTransactionIds.has(txId)) {
+      return;
+    }
+
+    this.monitoredTransactionIds.add(txId);
+    this.monitorTransactionConfirmation(txId, boxIds, txSpendHeight)
+      .catch(error => {
+        this.logger.error('Transaction monitoring failed', {
+          component: 'processor',
+          txId,
+          error: error as Error
+        });
+      })
+      .finally(() => {
+        this.monitoredTransactionIds.delete(txId);
+      });
   }
 
   // Monitor transaction confirmation
@@ -961,7 +1093,8 @@ export class StorageRentBot {
     }
 
     const reconciliation = await this.reconcileUnconfirmedBoxes(boxIds, txId, {
-      requeueUnspent: !finality.expired
+      requeueUnspent: !finality.conflictTxId,
+      keepUnspentPending: !finality.expired && !finality.conflictTxId
     });
 
     if (reconciliation.claimed === boxIds.length) {
@@ -973,34 +1106,68 @@ export class StorageRentBot {
       return;
     }
 
-    await this.database.updateTransactionStatus(txId, 'failed');
-
-    if (reconciliation.requeued > 0) {
-      this.logger.warn('Transaction unresolved; requeued unspent boxes', {
+    if (!finality.expired && !finality.conflictTxId && reconciliation.conflicted === 0) {
+      this.logger.warn('Transaction still pending; keeping boxes pending', {
         component: 'monitor',
         txId,
         txSpendHeight,
+        currentHeight: finality.currentHeight,
+        expiryHeight: finality.expiryHeight,
+        pending: reconciliation.pending,
+        claimed: reconciliation.claimed,
+        timedOut: Boolean(finality.timedOut)
+      });
+
+      if (this.isRunning) {
+        const retryDelay = Math.max(this.config.transactionFinalityCheckMs, 30000);
+        const retryTimer = setTimeout(() => {
+          if (this.isRunning) {
+            this.startTransactionMonitor(txId, boxIds, txSpendHeight);
+          }
+        }, retryDelay);
+        retryTimer.unref?.();
+      }
+
+      return;
+    }
+
+    await this.database.updateTransactionStatus(txId, 'failed');
+
+    const conflictTxId = finality.conflictTxId;
+    if (conflictTxId || reconciliation.conflicted > 0) {
+      this.logger.warn('Transaction lost storage-rent race', {
+        component: 'monitor',
+        txId,
+        conflictTxId,
+        retired: reconciliation.retired,
+        conflicted: reconciliation.conflicted,
+        claimed: reconciliation.claimed
+      });
+      return;
+    }
+
+    if (reconciliation.requeued > 0) {
+      this.logger.warn('Transaction not confirmed after grace window; requeued unspent boxes', {
+        component: 'monitor',
+        txId,
+        txSpendHeight,
+        currentHeight: finality.currentHeight,
+        expiryHeight: finality.expiryHeight,
         requeued: reconciliation.requeued,
         retired: reconciliation.retired,
         conflicted: reconciliation.conflicted,
         claimed: reconciliation.claimed
       });
-
-      this.runScanAndProcess().catch(error => {
-        this.logger.error('Immediate retry after unconfirmed transaction failed', {
-          component: 'monitor',
-          txId,
-          error: error as Error
-        });
-      });
       return;
     }
 
     if (reconciliation.retired > 0) {
-      this.logger.warn('Transaction missed its storage-rent height; retired unspent boxes', {
+      this.logger.warn('Transaction retired unavailable boxes', {
         component: 'monitor',
         txId,
         txSpendHeight,
+        currentHeight: finality.currentHeight,
+        expiryHeight: finality.expiryHeight,
         retired: reconciliation.retired,
         conflicted: reconciliation.conflicted,
         claimed: reconciliation.claimed
@@ -1008,31 +1175,22 @@ export class StorageRentBot {
       return;
     }
 
-    const conflictTxId = finality.conflictTxId;
-    if (conflictTxId) {
-      this.logger.warn('Transaction lost storage-rent race', {
-        component: 'monitor',
-        txId,
-        conflictTxId,
-        conflicted: reconciliation.conflicted
-      });
-    } else {
-      this.logger.warn('Transaction confirmation timeout', {
-        component: 'monitor',
-        txId,
-        conflicted: reconciliation.conflicted,
-        claimed: reconciliation.claimed
-      });
-    }
+    this.logger.warn('Transaction confirmation timeout', {
+      component: 'monitor',
+      txId,
+      conflicted: reconciliation.conflicted,
+      claimed: reconciliation.claimed
+    });
   }
 
   private async reconcileUnconfirmedBoxes(
     boxIds: string[],
     txId: string,
-    options: { requeueUnspent?: boolean } = {}
+    options: { requeueUnspent?: boolean; keepUnspentPending?: boolean } = {}
   ): Promise<BoxReconciliation> {
-    const result: BoxReconciliation = { claimed: 0, requeued: 0, conflicted: 0, retired: 0 };
+    const result: BoxReconciliation = { claimed: 0, requeued: 0, conflicted: 0, retired: 0, pending: 0 };
     const requeueUnspent = options.requeueUnspent ?? true;
+    const keepUnspentPending = options.keepUnspentPending ?? false;
 
     for (const boxId of boxIds) {
       const spentTxId = await this.ergoNode.getBoxSpentTransactionId(boxId).catch(() => null);
@@ -1050,6 +1208,12 @@ export class StorageRentBot {
 
       const box = await this.database.getBoxById(boxId).catch(() => null);
       if (!box) {
+        continue;
+      }
+
+      if (keepUnspentPending) {
+        await this.database.updateBoxStatus(boxId, 'pending', txId || box.txId);
+        result.pending += 1;
         continue;
       }
 
@@ -1082,14 +1246,44 @@ export class StorageRentBot {
     return errorMessage.toLowerCase().includes('double spending');
   }
 
+  private isNonRetryableBatchError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const lowerMessage = message.toLowerCase();
+
+    return lowerMessage.includes('scripts of all transaction inputs should pass verification') ||
+      lowerMessage.includes('success((false') ||
+      lowerMessage.includes('asset boxes need recreation or an external subsidy input') ||
+      lowerMessage.includes('underfunded boxes need an external subsidy input') ||
+      lowerMessage.includes('asset collection needs') ||
+      lowerMessage.includes('asset subsidy') ||
+      lowerMessage.includes('wallet has no pure erg utxo') ||
+      lowerMessage.includes('cannot pay positive storage rent') ||
+      lowerMessage.includes('no positive miner fee');
+  }
+
   private async waitForTransactionFinality(txId: string, boxIds: string[], txSpendHeight: number): Promise<TransactionFinality> {
-    const maxAttempts = 12;
-    const checkInterval = 10000; // 10 seconds
+    const checkInterval = this.config.transactionFinalityCheckMs;
+    const expiryHeight = txSpendHeight + this.config.transactionFinalityGraceBlocks;
+    const checksPerSlowBlock = Math.max(1, Math.ceil(180000 / checkInterval));
+    const maxAttempts = Math.max(12, (this.config.transactionFinalityGraceBlocks + 2) * checksPerSlowBlock);
+    let lastKnownHeight: number | undefined;
+    let lastExplorerCheckHeight: number | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, checkInterval));
+      if (attempt > 1) {
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+      }
 
-      const isConfirmed = await this.ergoNode.isTransactionConfirmed(txId).catch(error => {
+      const currentSubmitHeight = await this.ergoNode.getPrimarySubmitHeight()
+        .catch(() => this.ergoNode.getCurrentHeight());
+      lastKnownHeight = currentSubmitHeight;
+
+      const includeExplorer = currentSubmitHeight >= txSpendHeight && currentSubmitHeight !== lastExplorerCheckHeight;
+      if (includeExplorer) {
+        lastExplorerCheckHeight = currentSubmitHeight;
+      }
+
+      const isConfirmed = await this.ergoNode.isTransactionConfirmed(txId, { includeExplorer }).catch(error => {
         this.logger.warn('Transaction confirmation endpoint failed', {
           component: 'monitor',
           txId,
@@ -1104,7 +1298,7 @@ export class StorageRentBot {
       }
 
       const spentTransactionIds = await Promise.all(
-        boxIds.map(boxId => this.ergoNode.getBoxSpentTransactionId(boxId).catch(error => {
+        boxIds.map(boxId => this.ergoNode.getBoxSpentTransactionId(boxId, { includeExplorer }).catch(error => {
           this.logger.warn('Box spent check failed', {
             component: 'monitor',
             txId,
@@ -1126,22 +1320,28 @@ export class StorageRentBot {
         return { confirmed: false, conflictTxId };
       }
 
-      const currentSubmitHeight = await this.ergoNode.getBestSubmitNode(true)
-        .then(node => node.fullHeight)
-        .catch(() => this.ergoNode.getCurrentHeight());
-      if (currentSubmitHeight >= txSpendHeight) {
-        return { confirmed: false, expired: true };
+      if (currentSubmitHeight >= expiryHeight) {
+        return { confirmed: false, expired: true, currentHeight: currentSubmitHeight, expiryHeight };
       }
 
       this.logger.debug('Transaction not yet confirmed', {
         component: 'monitor',
         txId,
         attempt,
-        maxAttempts
+        maxAttempts,
+        currentHeight: currentSubmitHeight,
+        txSpendHeight,
+        expiryHeight,
+        includeExplorer
       });
     }
 
-    return { confirmed: false };
+    return {
+      confirmed: false,
+      timedOut: true,
+      expiryHeight,
+      ...(lastKnownHeight !== undefined && { currentHeight: lastKnownHeight })
+    };
   }
 
   // Update wallet balance in database

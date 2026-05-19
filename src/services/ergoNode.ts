@@ -156,6 +156,41 @@ export class ErgoNodeService {
     return this.normalizeNodeUrl(this.config.txSubmitNodeUrl);
   }
 
+  private getExplorerApiBaseUrl(): string {
+    const explorerUrl = this.normalizeNodeUrl(this.config.ergoExplorerUrl);
+    return explorerUrl.endsWith('/api/v1') ? explorerUrl : `${explorerUrl}/api/v1`;
+  }
+
+  private async getExplorerTransaction(txId: string): Promise<any | null> {
+    try {
+      const response = await axios.get(`${this.getExplorerApiBaseUrl()}/transactions/${txId}`, {
+        timeout: 10000
+      });
+      return response.data;
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        return null;
+      }
+
+      throw new Error(`Failed to get explorer transaction ${txId}: ${error.message}`);
+    }
+  }
+
+  private async getExplorerBox(boxId: string): Promise<any | null> {
+    try {
+      const response = await axios.get(`${this.getExplorerApiBaseUrl()}/boxes/${boxId}`, {
+        timeout: 10000
+      });
+      return response.data;
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        return null;
+      }
+
+      throw new Error(`Failed to get explorer box ${boxId}: ${error.message}`);
+    }
+  }
+
   private getConfiguredSubmitNodeUrls(): string[] {
     const urls = [this.getPrimarySubmitNodeUrl(), ...this.config.additionalSubmitNodeUrls.map(url => this.normalizeNodeUrl(url))];
     return Array.from(new Set(urls));
@@ -437,6 +472,11 @@ export class ErgoNodeService {
 
     const bestHeight = nodes.reduce((height, node) => Math.max(height, node.fullHeight), 0);
     const bestHeightNodes = nodes.filter(node => node.fullHeight === bestHeight);
+    const primarySubmitNode = bestHeightNodes.find(node => node.url === this.getPrimarySubmitNodeUrl());
+    if (primarySubmitNode) {
+      return primarySubmitNode;
+    }
+
     bestHeightNodes.sort((a, b) => (a.responseTimeMs ?? Number.MAX_SAFE_INTEGER) - (b.responseTimeMs ?? Number.MAX_SAFE_INTEGER));
 
     return bestHeightNodes[0]!;
@@ -786,6 +826,22 @@ export class ErgoNodeService {
     }
   }
 
+  private async getBoxByIdFromNode(nodeUrl: string, boxId: string): Promise<BoxData | null> {
+    try {
+      const response = await axios.get(`${this.normalizeNodeUrl(nodeUrl)}/utxo/byId/${boxId}`, {
+        timeout: 5000,
+        headers: this.headers
+      });
+      return response.data;
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        return null;
+      }
+
+      throw new Error(`Failed to get box ${boxId} from ${nodeUrl}: ${error.message}`);
+    }
+  }
+
   // Calculate box size using Fleet SDK estimation
   private calculateBoxSize(box: BoxData): number {
     try {
@@ -797,6 +853,55 @@ export class ErgoNodeService {
       // Fallback to standard box size
       return 49;
     }
+  }
+
+  private calculateStorageRentClaimableFee(
+    box: BoxData,
+    rentParams: StorageRentParameters
+  ): {
+    boxSize: number;
+    rentFee: bigint;
+    claimableFee: bigint;
+    minRecreatedValue: bigint;
+  } {
+    const boxSize = this.calculateBoxSize(box);
+    const rentFee = BigInt(boxSize) * BigInt(rentParams.storageFeeFactor);
+    const boxValue = BigInt(box.value);
+    const minRecreatedValue = BigInt(boxSize) * BigInt(rentParams.minValuePerByte);
+    const hasAssets = (box.assets || []).length > 0;
+    const canCollectAssetBox = this.config.storageRentMode === 'address' && hasAssets;
+
+    if (canCollectAssetBox && this.config.enableAssetSubsidy) {
+      return {
+        boxSize,
+        rentFee,
+        minRecreatedValue,
+        claimableFee: boxValue
+      };
+    }
+
+    if (boxValue <= rentFee) {
+      return {
+        boxSize,
+        rentFee,
+        minRecreatedValue,
+        claimableFee: 0n
+      };
+    }
+
+    return {
+      boxSize,
+      rentFee,
+      minRecreatedValue,
+      claimableFee: boxValue > minRecreatedValue
+        ? minBigInt(rentFee, boxValue - minRecreatedValue)
+        : 0n
+    };
+  }
+
+  private canClaimStorageRent(box: BoxData, rentParams: StorageRentParameters): boolean {
+    const { claimableFee } = this.calculateStorageRentClaimableFee(box, rentParams);
+    return claimableFee >= BigInt(this.config.minRentThreshold);
   }
 
   // Estimate VLQ (Variable Length Quantity) encoding size
@@ -891,15 +996,8 @@ export class ErgoNodeService {
           continue;
         }
 
-        const boxSize = this.calculateBoxSize(box);
-        const rentFee = BigInt(boxSize) * BigInt(rentParams.storageFeeFactor);
+        const { boxSize, rentFee, claimableFee } = this.calculateStorageRentClaimableFee(box, rentParams);
         const boxValue = BigInt(box.value);
-        const minRecreatedValue = BigInt(boxSize) * BigInt(rentParams.minValuePerByte);
-        const claimableFee = boxValue <= rentFee
-          ? boxValue
-          : boxValue > minRecreatedValue
-            ? minBigInt(rentFee, boxValue - minRecreatedValue)
-            : 0n;
 
         if (claimableFee < BigInt(this.config.minRentThreshold)) {
           belowThreshold++;
@@ -913,22 +1011,30 @@ export class ErgoNodeService {
           boxSize,
           value: boxValue,
           rentFee,
-          status: blocksUntilEligible <= 0 ? 'pending' : 'queued',
+          status: 'queued',
           discoveredAt: new Date(),
           ergoTree: box.ergoTree,
           assets: box.assets ? box.assets.map((asset: any) => ({
             tokenId: asset.tokenId,
             amount: BigInt(asset.amount)
           })) : [],
-          additionalRegisters: box.additionalRegisters || {}
+          additionalRegisters: box.additionalRegisters || {},
+          boxData: box
         });
       }
 
       candidates.sort((a, b) => {
         const aBlocksUntil = a.creationHeight + minAge - spendHeight;
         const bBlocksUntil = b.creationHeight + minAge - spendHeight;
+        const aReadyRank = Math.max(aBlocksUntil, 0);
+        const bReadyRank = Math.max(bBlocksUntil, 0);
+
+        if (aReadyRank !== bReadyRank) {
+          return aReadyRank - bReadyRank;
+        }
+
         if (aBlocksUntil !== bBlocksUntil) {
-          return aBlocksUntil - bBlocksUntil;
+          return bBlocksUntil - aBlocksUntil;
         }
 
         if (a.value === b.value) {
@@ -962,7 +1068,8 @@ export class ErgoNodeService {
           const boxes = boxesByHeight.get(height)!;
           const claimableAtHeight = height + minAge;
           const blocksUntilClaimable = claimableAtHeight - spendHeight;
-          console.log(`Height ${height}: ${boxes.length} boxes → claimable at height ${claimableAtHeight} (in ${blocksUntilClaimable} blocks)`);
+          const claimableSummary = blocksUntilClaimable <= 0 ? 'now' : `in ${blocksUntilClaimable} blocks`;
+          console.log(`Height ${height}: ${boxes.length} boxes → claimable at height ${claimableAtHeight} (${claimableSummary})`);
           for (const box of boxes.slice(0, 3)) {
             console.log(`  ${box.boxId} value=${box.value} rentFee=${box.rentFee} status=${box.status}`);
           }
@@ -1016,7 +1123,7 @@ export class ErgoNodeService {
         }
 
         const boxAge = spendHeight - box.creationHeight;
-        if (boxAge < rentParams.storagePeriodBlocks) {
+        if (boxAge < rentParams.storagePeriodBlocks || !this.canClaimStorageRent(box, rentParams)) {
           invalid.push(boxId);
           continue;
         }
@@ -1030,9 +1137,45 @@ export class ErgoNodeService {
     return { valid, invalid };
   }
 
-  async getBoxSpentTransactionId(boxId: string): Promise<string | null> {
-    const box = await this.getIndexedBoxById(boxId);
-    return box?.spentTransactionId || null;
+  async validateBoxesOnNode(
+    nodeUrl: string,
+    boxIds: string[],
+    currentHeight: number,
+    rentParams: StorageRentParameters
+  ): Promise<{ valid: string[]; invalid: string[] }> {
+    const spendHeight = currentHeight + 1;
+    const checks = await Promise.all(boxIds.map(async boxId => {
+      try {
+        const box = await this.getBoxByIdFromNode(nodeUrl, boxId);
+        const isValid = Boolean(box) &&
+          !box?.spentTransactionId &&
+          spendHeight - Number(box?.creationHeight ?? 0) >= rentParams.storagePeriodBlocks &&
+          this.canClaimStorageRent(box!, rentParams);
+
+        return { boxId, valid: isValid };
+      } catch {
+        return { boxId, valid: false };
+      }
+    }));
+
+    return {
+      valid: checks.filter(check => check.valid).map(check => check.boxId),
+      invalid: checks.filter(check => !check.valid).map(check => check.boxId)
+    };
+  }
+
+  async getBoxSpentTransactionId(boxId: string, options: { includeExplorer?: boolean } = {}): Promise<string | null> {
+    const indexedBox = await this.getIndexedBoxById(boxId).catch(() => null);
+    if (indexedBox?.spentTransactionId) {
+      return indexedBox.spentTransactionId;
+    }
+
+    if (!options.includeExplorer) {
+      return null;
+    }
+
+    const explorerBox = await this.getExplorerBox(boxId).catch(() => null);
+    return explorerBox?.spentTransactionId || null;
   }
 
   // Submit transaction
@@ -1050,16 +1193,36 @@ export class ErgoNodeService {
   }
 
   // Check if transaction is confirmed
-  async isTransactionConfirmed(txId: string): Promise<boolean> {
+  async isTransactionConfirmed(txId: string, options: { includeExplorer?: boolean } = {}): Promise<boolean> {
+    const isConfirmedTransaction = (transaction: any): boolean => (
+      Boolean(transaction) && (
+        Number(transaction.numConfirmations ?? 0) > 0 ||
+        Boolean(transaction.blockId) ||
+        Number(transaction.inclusionHeight ?? 0) > 0
+      )
+    );
+
     try {
       const response = await this.client.get(`/blockchain/transaction/byId/${txId}`);
-      return response.status === 200 && response.data.numConfirmations > 0;
-    } catch (error: any) {
-      if (error.response?.status === 404) {
-        return false; // Transaction not found
+      if (response.status === 200 && isConfirmedTransaction(response.data)) {
+        return true;
       }
-      throw new Error(`Failed to check transaction ${txId}: ${error.message}`);
+    } catch (error: any) {
+      if (error.response?.status !== 404) {
+        console.warn(`Failed to check transaction ${txId} on indexed node: ${error.message}`);
+      }
     }
+
+    if (!options.includeExplorer) {
+      return false;
+    }
+
+    const explorerTransaction = await this.getExplorerTransaction(txId).catch(error => {
+      console.warn(error.message || error);
+      return null;
+    });
+
+    return isConfirmedTransaction(explorerTransaction);
   }
 
   // Get wallet balance from actual wallet UTXOs

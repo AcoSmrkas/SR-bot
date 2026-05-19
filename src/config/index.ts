@@ -53,10 +53,13 @@ export function loadConfig(): Config {
     'your_wallet_mnemonic_phrase_here',
     'your twelve word mnemonic phrase here'
   ]);
-  const walletPassword = getOptionalEnvVar('WALLET_PASSWORD', [
-    'your_wallet_password_here',
-    'your_wallet_password'
-  ]);
+  const walletPassword = walletMnemonic
+    ? getOptionalEnvVar('WALLET_PASSWORD', [
+      'your_wallet_password_here',
+      'your_wallet_password',
+      'your_password_here'
+    ], { allowEmpty: true }) ?? ''
+    : undefined;
 
   const config: Config = {
     // Ergo Node Configuration
@@ -77,8 +80,7 @@ export function loadConfig(): Config {
     confirmPrimaryBeforeBroadcast: getEnvBoolean('CONFIRM_PRIMARY_BEFORE_BROADCAST', false),
 
     // Wallet Configuration
-    ...(walletMnemonic && { walletMnemonic }),
-    ...(walletPassword && { walletPassword }),
+    ...(walletMnemonic && { walletMnemonic, walletPassword: walletPassword ?? '' }),
 
     // Bot Configuration
     minRentThreshold: getEnvNumber('MIN_RENT_THRESHOLD', 1000000), // 0.001 ERG
@@ -109,8 +111,12 @@ export function loadConfig(): Config {
     // Transaction Configuration
     transactionFee: getEnvNumber('TRANSACTION_FEE', 1000000), // 0.001 ERG
     maxTransactionSize: getEnvNumber('MAX_TRANSACTION_SIZE', 8192), // bytes
+    transactionFinalityCheckMs: getEnvNumber('TRANSACTION_FINALITY_CHECK_MS', 10000),
+    transactionFinalityGraceBlocks: getEnvNumber('TRANSACTION_FINALITY_GRACE_BLOCKS', 6),
     storageRentMode: getEnvVar('STORAGE_RENT_MODE', 'miner').toLowerCase() as 'miner' | 'address',
     storageRentCollectAddress: getEnvVar('STORAGE_RENT_COLLECT_ADDRESS', defaultStorageRentCollectAddress).trim(),
+    enableAssetSubsidy: getEnvBoolean('ENABLE_ASSET_SUBSIDY', false),
+    maxAssetSubsidyNanoErgs: getEnvNumber('MAX_ASSET_SUBSIDY_NANOERGS', 10000000),
 
     // Bot Behavior
     dryRun: getEnvBoolean('DRY_RUN', process.env.NODE_ENV === 'dry-run'),
@@ -132,11 +138,21 @@ export function loadConfig(): Config {
   return config;
 }
 
-function getOptionalEnvVar(name: string, placeholders: string[]): string | undefined {
-  const value = process.env[name]?.trim();
-  if (!value || placeholders.includes(value)) {
+function getOptionalEnvVar(
+  name: string,
+  placeholders: string[],
+  options: { allowEmpty?: boolean } = {}
+): string | undefined {
+  const rawValue = process.env[name];
+  if (rawValue === undefined) {
     return undefined;
   }
+
+  const value = rawValue.trim();
+  if ((!value && !options.allowEmpty) || placeholders.includes(value)) {
+    return undefined;
+  }
+
   return value;
 }
 
@@ -220,12 +236,32 @@ function validateConfig(config: Config): void {
     throw new Error('MAX_TRANSACTION_SIZE must be between 1024 and 32768 bytes');
   }
 
+  if (config.transactionFinalityCheckMs < 1000 || config.transactionFinalityCheckMs > 60000) {
+    throw new Error('TRANSACTION_FINALITY_CHECK_MS must be between 1000 and 60000 milliseconds');
+  }
+
+  if (config.transactionFinalityGraceBlocks < 0 || config.transactionFinalityGraceBlocks > 100) {
+    throw new Error('TRANSACTION_FINALITY_GRACE_BLOCKS must be between 0 and 100');
+  }
+
   if (!['miner', 'address'].includes(config.storageRentMode)) {
     throw new Error('STORAGE_RENT_MODE must be either "miner" or "address"');
   }
 
   if (config.storageRentMode === 'address' && !config.storageRentCollectAddress) {
     throw new Error('STORAGE_RENT_COLLECT_ADDRESS is required when STORAGE_RENT_MODE=address');
+  }
+
+  if (config.maxAssetSubsidyNanoErgs < 0) {
+    throw new Error('MAX_ASSET_SUBSIDY_NANOERGS must be zero or greater');
+  }
+
+  if (config.enableAssetSubsidy && config.storageRentMode !== 'address') {
+    throw new Error('ENABLE_ASSET_SUBSIDY requires STORAGE_RENT_MODE=address');
+  }
+
+  if (config.enableAssetSubsidy && !config.walletMnemonic) {
+    throw new Error('ENABLE_ASSET_SUBSIDY requires WALLET_MNEMONIC');
   }
 
   if (config.metricsPort < 1024 || config.metricsPort > 65535) {
@@ -240,11 +276,7 @@ function validateConfig(config: Config): void {
     throw new Error('UI_REFRESH_MS must be between 500 and 60000 milliseconds');
   }
 
-  if (config.walletMnemonic || config.walletPassword) {
-    if (!config.walletMnemonic || !config.walletPassword) {
-      throw new Error('WALLET_MNEMONIC and WALLET_PASSWORD must be provided together');
-    }
-
+  if (config.walletMnemonic !== undefined) {
     const mnemonicWords = config.walletMnemonic.trim().split(/\s+/);
     if (mnemonicWords.length !== 12 && mnemonicWords.length !== 15 && mnemonicWords.length !== 24) {
       throw new Error('WALLET_MNEMONIC must be 12, 15, or 24 words');
