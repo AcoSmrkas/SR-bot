@@ -36,6 +36,7 @@ export class StorageRentBot {
   private lastIndexedBehindLogKey: string | null = null;
   private pendingRecoveryComplete: boolean = false;
   private monitoredTransactionIds: Set<string> = new Set();
+  private mempoolConflictRetryAfterHeightByBoxId: Map<string, number> = new Map();
   private startTime: Date;
   private logger: any; // Will be injected
 
@@ -319,8 +320,29 @@ export class StorageRentBot {
         const isEligible = spendHeight >= eligibleAtHeight;
 
         if (isEligible) {
-          eligibleGroups.push({ height, boxes });
-          heightsToRemove.push(height);
+          const readyBoxes: EligibleBox[] = [];
+          const coolingBoxes: EligibleBox[] = [];
+
+          for (const box of boxes) {
+            const retryAfterHeight = this.mempoolConflictRetryAfterHeightByBoxId.get(box.boxId);
+            if (retryAfterHeight !== undefined && currentHeight < retryAfterHeight) {
+              coolingBoxes.push(box);
+              continue;
+            }
+
+            this.mempoolConflictRetryAfterHeightByBoxId.delete(box.boxId);
+            readyBoxes.push(box);
+          }
+
+          if (readyBoxes.length > 0) {
+            eligibleGroups.push({ height, boxes: readyBoxes });
+          }
+
+          if (coolingBoxes.length > 0) {
+            this.queuedBoxesByHeight.set(height, coolingBoxes);
+          } else {
+            heightsToRemove.push(height);
+          }
         }
       }
 
@@ -711,6 +733,7 @@ export class StorageRentBot {
     };
 
     let batchBoxes = boxes;
+    let buildHeightForRetry: number | undefined;
 
     try {
       this.logger.info('Processing batch', {
@@ -740,6 +763,7 @@ export class StorageRentBot {
 
       let submitNode = this.config.dryRun ? null : await this.ergoNode.getBestSubmitNode(true);
       let buildHeight = submitNode?.fullHeight ?? await this.ergoNode.getPrimarySubmitHeight();
+      buildHeightForRetry = buildHeight;
       if (submitNode) {
         const liveValidation = await this.ergoNode.validateBoxesOnNode(
           submitNode.url,
@@ -809,6 +833,7 @@ export class StorageRentBot {
         if (!submitNode) {
 		          submitNode = await this.ergoNode.getBestSubmitNode(true);
 		          buildHeight = submitNode.fullHeight;
+              buildHeightForRetry = buildHeight;
 		          ({
                 unsignedTx,
                 inputBoxes,
@@ -838,8 +863,9 @@ export class StorageRentBot {
             batchSize: batchBoxes.length
           });
 
-	          submitNode = refreshedSubmitNode;
-	          buildHeight = submitNode.fullHeight;
+		          submitNode = refreshedSubmitNode;
+		          buildHeight = submitNode.fullHeight;
+              buildHeightForRetry = buildHeight;
           const liveValidation = await this.ergoNode.validateBoxesOnNode(
             submitNode.url,
             batchBoxes.map(box => box.boxId),
@@ -914,7 +940,7 @@ export class StorageRentBot {
               returnedTxId: primarySubmitId
             });
           }
-        } catch (error) {
+	    } catch (error) {
           primaryRejectReason = error instanceof Error ? error.message : String(error);
 
           if (!this.isMempoolDoubleSpend(primaryRejectReason)) {
@@ -1023,21 +1049,32 @@ export class StorageRentBot {
         error: error as Error
       });
 
-      result.failedTransactions = 1;
-      result.errors.push(`Batch ${batchIndex} failed: ${error}`);
-      const retryUnspentBoxes = !this.isNonRetryableBatchError(error);
+	      result.failedTransactions = 1;
+	      result.errors.push(`Batch ${batchIndex} failed: ${error}`);
+	      const retryUnspentBoxes = !this.isNonRetryableBatchError(error);
+        const retryAfterHeight = this.isNoAlternateMempoolConflict(error) && buildHeightForRetry !== undefined
+          ? buildHeightForRetry + 1
+          : undefined;
+        if (retryAfterHeight !== undefined) {
+          this.cooldownBoxesAfterMempoolConflict(batchBoxes, retryAfterHeight, error);
+        }
 
-      const reconciliation = await this.reconcileUnconfirmedBoxes(
-        batchBoxes.map(box => box.boxId),
-        '',
-        { requeueUnspent: retryUnspentBoxes }
-      );
+	      const reconciliation = await this.reconcileUnconfirmedBoxes(
+	        batchBoxes.map(box => box.boxId),
+	        '',
+	        { requeueUnspent: retryUnspentBoxes }
+	      );
       if (reconciliation.requeued > 0 || reconciliation.retired > 0) {
-        this.logger.warn(retryUnspentBoxes
-          ? 'Batch failed; requeued unspent boxes'
-          : 'Batch failed with non-retryable validation error; retired unspent boxes', {
+        const message = retryAfterHeight !== undefined
+          ? 'Batch hit mempool conflict; cooling down unspent boxes until next block'
+          : retryUnspentBoxes
+            ? 'Batch failed; requeued unspent boxes'
+            : 'Batch failed with non-retryable validation error; retired unspent boxes';
+
+        this.logger.warn(message, {
           component: 'processor',
           batchIndex,
+          retryAfterHeight,
           requeued: reconciliation.requeued,
           retired: reconciliation.retired,
           conflicted: reconciliation.conflicted,
@@ -1244,6 +1281,26 @@ export class StorageRentBot {
 
   private isMempoolDoubleSpend(errorMessage: string): boolean {
     return errorMessage.toLowerCase().includes('double spending');
+  }
+
+  private isNoAlternateMempoolConflict(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const lowerMessage = message.toLowerCase();
+    return lowerMessage.includes('primary node rejected double spend') &&
+      lowerMessage.includes('no alternate node accepted transaction');
+  }
+
+  private cooldownBoxesAfterMempoolConflict(boxes: EligibleBox[], retryAfterHeight: number, error: unknown): void {
+    for (const box of boxes) {
+      this.mempoolConflictRetryAfterHeightByBoxId.set(box.boxId, retryAfterHeight);
+    }
+
+    this.logger.warn('Cooling down mempool-conflicted boxes until submit height advances', {
+      component: 'processor',
+      boxCount: boxes.length,
+      retryAfterHeight,
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
 
   private isNonRetryableBatchError(error: unknown): boolean {

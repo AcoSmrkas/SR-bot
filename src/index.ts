@@ -11,6 +11,9 @@ try {
 
 console.log('Importing config...');
 import { getConfig } from './config';
+import type { Config } from './types';
+import fs from 'fs';
+import path from 'path';
 console.log('Config imported successfully');
 
 console.log('Importing logger...');
@@ -41,6 +44,72 @@ console.log('UIServer imported successfully');
 let bot: StorageRentBot | null = null;
 let uiServer: UIServer | null = null;
 let logger: any = null;
+let lockFd: number | null = null;
+let lockFilePath: string | null = null;
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function readExistingLock(filePath: string): { pid?: number; cwd?: string } | null {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function acquireProcessLock(config: Config): void {
+  const lockDir = path.dirname(path.resolve(config.databasePath));
+  fs.mkdirSync(lockDir, { recursive: true });
+  lockFilePath = path.join(lockDir, 'sr-bot.lock');
+
+  while (true) {
+    try {
+      lockFd = fs.openSync(lockFilePath, 'wx');
+      fs.writeFileSync(lockFd, JSON.stringify({
+        pid: process.pid,
+        cwd: process.cwd(),
+        startedAt: new Date().toISOString()
+      }));
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error;
+      }
+
+      const existingLock = readExistingLock(lockFilePath);
+      if (existingLock?.pid && isProcessAlive(existingLock.pid)) {
+        throw new Error(`Another SR-bot process is already running: pid=${existingLock.pid}, cwd=${existingLock.cwd || 'unknown'}`);
+      }
+
+      fs.unlinkSync(lockFilePath);
+    }
+  }
+}
+
+function releaseProcessLock(): void {
+  if (lockFd !== null) {
+    fs.closeSync(lockFd);
+    lockFd = null;
+  }
+
+  if (!lockFilePath) {
+    return;
+  }
+
+  const existingLock = readExistingLock(lockFilePath);
+  if (existingLock?.pid === process.pid) {
+    fs.unlinkSync(lockFilePath);
+  }
+
+  lockFilePath = null;
+}
 
 // Graceful shutdown handler
 async function gracefulShutdown(signal: string): Promise<void> {
@@ -64,9 +133,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
       await logger.close();
     }
 
+    releaseProcessLock();
     process.exit(0);
   } catch (error) {
     console.error('Error during shutdown:', error);
+    releaseProcessLock();
     process.exit(1);
   }
 }
@@ -168,6 +239,7 @@ async function main(): Promise<void> {
     // Load configuration
     const config = getConfig();
     console.log('Configuration loaded successfully');
+    acquireProcessLock(config);
     console.log('Config:', { 
       ergoNodeUrl: config.ergoNodeUrl,
       txSubmitNodeUrl: config.txSubmitNodeUrl,
@@ -247,6 +319,7 @@ async function main(): Promise<void> {
     } else {
       console.error('Failed to start SR-bot:', error);
     }
+    releaseProcessLock();
     process.exit(1);
   }
 }
